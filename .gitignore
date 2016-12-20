@@ -1,0 +1,17 @@
+fluxtop
+fluxcap
+ramdisk
+*.o
+*.swp
+Makefile.in
+aclocal.m4
+autom4te.cache
+compile
+configure
+depcomp
+install-sh
+missing
+Makefile
+config.log
+config.status
+.deps

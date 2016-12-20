@@ -1,0 +1,9 @@
+[submodule "lib/uthash"]
+	path = lib/uthash
+	url = https://github.com/troydhanson/uthash.git
+[submodule "lib/tpl"]
+	path = lib/tpl
+	url = https://github.com/troydhanson/tpl.git
+[submodule "lib/shr"]
+	path = lib/shr
+	url = https://github.com/troydhanson/shr.git
