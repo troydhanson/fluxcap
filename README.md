@@ -206,3 +206,38 @@ The examples above run the processes "by hand" on the command line.  In
 practice these processes would be placed under the supervision of an init
 manager.  I use [pmtr](http://troydhanson.github.io/pmtr/) for this purpose.
 
+#### Encapsulation modes
+
+Fluxcap can transmit packets over a routed/switched network too. This requires
+use of one the encapsulation modes. The supported encapsulation modes are GRE,
+GRETAP and ERSPAN.
+
+    fluxcap -tx -E gre:192.168.102.100 tap     # GRE encapsulation
+    fluxcap -tx -E gretap:192.168.102.100 tap  # GRETAP encapsulation
+    fluxcap -tx -E erspan:192.168.102.100 tap  # ERSPAN encapsulation
+
+On the remote (recipient) end, you can confirm the data is being received using:
+
+    tcpdump -i eth0 -nne proto gre
+
+You can take this a step further, and have a Linux recipient decapsulate the
+GRE or GRETAP encapsulation. This results in Linux presenting a virtual NIC
+with the decapsulated packets.
+
+    # GRE decapsulation
+    modprobe ip_gre
+    ip tunnel add gre1 mode gre remote 192.168.102.1 local 192.168.102.100 ttl 255
+    ip link set gre1 up
+    tcpdump -i gre1 -nne
+
+ If the fluxcap transmitter uses gretap ("transparent ethernet bridging") 
+ encapsulation instead, which preserves MAC addresses in the encapsulation,
+ it can be received this way instead:
+
+    # GRETAP decapsulation
+    modprobe ip_gre
+    ip link add gretap1 type gretap local 192.168.102.100 remote 192.168.102.1
+    ip link set gretap1 up
+    tcpdump -i gretap1 -nne
+
+

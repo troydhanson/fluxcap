@@ -22,7 +22,7 @@
  * fluxcap: a network tap replication and aggregation tool
  *
  */
-
+#define FLUXCAP_VERSION "1.1"
 #define MAX_PKT 100000         /* max length of packet */
 #define MAX_NIC 64             /* longest NIC name we accept */
 #define BATCH_SIZE (1024*1024) /* bytes buffered before shr_writev */
@@ -32,6 +32,14 @@ struct bb {
   size_t u; /* batch buffer used */
   char  *d; /* batch buffer */
   UT_vector /* of struct iovec */ *iov; 
+};
+
+struct encap { /* this is used in tx GRE/ERSPAN encapsulation mode */
+  int enable;
+  enum {mode_gre=0, mode_gretap, mode_erspan} mode;
+  struct in_addr dst;
+  int session;             /* TODO make configurable */
+  uint32_t session_seqno;  /* TODO should be kept per-session */
 };
 
 struct {
@@ -52,6 +60,7 @@ struct {
   char pkt[MAX_PKT];
   struct shr *ring;
   size_t size; /* ring create size (-cr), or snaplen (-rx/-tx) */
+  struct encap encap;
   /* auxilliary rings; for tee or funnel modes */
   UT_vector /* of ptr */ *aux_rings; 
   UT_vector /* of int */ *aux_fd; 
@@ -116,7 +125,9 @@ UT_mm* utmm_ptr = &_utmm_ptr;
 int sigs[] = {SIGHUP,SIGTERM,SIGINT,SIGQUIT,SIGALRM};
 
 void usage() {
-  fprintf(stderr,"usage: %s [-tx|-rx|-cr|-T|-F|-m] [options] <ring>\n"
+  fprintf(stderr,
+                 "fluxcap version " FLUXCAP_VERSION "\n"
+                 "usage: %s [-tx|-rx|-cr|-T|-F|-m] [options] <ring>\n"
                  "\n"
                  " transmit:       -tx -i <eth>  <ring>\n"
                  " receive:        -rx -i <eth>  <ring>\n"
@@ -126,12 +137,18 @@ void usage() {
                  "\n"
                  "additional tx/rx options:\n"
                  "\n"
-                 "           -V <vlan>    (inject VLAN tag)\n"
-                 "           -s <size>    (snaplen)\n"
-                 "           -D <n>       (trim n tail bytes)\n"
-                 "           -v           (verbose)\n"
+                 "           -V <vlan>     (inject VLAN tag)\n"
+                 "           -s <size>     (snaplen)\n"
+                 "           -D <n>        (trim n tail bytes)\n"
+                 "           -v            (verbose)\n"
                  "\n"
                  "  <size> may have k/m/g/t suffix\n"
+                 "\n"
+                 "encapsulation modes (tx-only):\n"
+                 "\n"
+                 "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
+                 "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation)\n"
+                 "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation)\n"
                  "\n",
           cfg.prog);
   exit(-1);
@@ -212,54 +229,60 @@ int setup_rx(void) {
 }
 
 int setup_tx(void) {
-  int rc=-1, ec;
+  int rc=-1, ec, one = 1;
 
+  /* create the transmit socket;  see raw(7) and packet(7).
+   * encap mode uses an IP "raw socket" (i.e. AF_INET, SOCK_RAW) [IP level]
+   * NIC tx mode uses a "packet socket" (i.e. AF_PACKET, SOCK_RAW) [link level]
+   */
+  int domain = cfg.encap.enable ? AF_INET : AF_PACKET;
   int protocol = htons(ETH_P_ALL);
-
-  /* create the packet socket */
-  cfg.tx_fd = socket(AF_PACKET, SOCK_RAW, protocol);
+  cfg.tx_fd = socket(domain, SOCK_RAW, protocol);
   if (cfg.tx_fd == -1) {
     fprintf(stderr,"socket: %s\n", strerror(errno));
     goto done;
   }
 
-  /* convert interface name to index (in ifr.ifr_ifindex) */
-  struct ifreq ifr;
-  strncpy(ifr.ifr_name, cfg.dev, sizeof(ifr.ifr_name));
-  ec = ioctl(cfg.tx_fd, SIOCGIFINDEX, &ifr);
-  if (ec < 0) {
-    fprintf(stderr,"failed to find interface %s\n", cfg.dev);
-    goto done;
-  }
-  cfg.dev_ifindex = ifr.ifr_ifindex;
+  if (cfg.encap.enable) {
 
-#if 0
-  ec = ioctl(cfg.tx_fd, SIOCETHTOOL, &ifr);
-  if (ec < 0) {
-    fprintf(stderr,"failed to find interface %s\n", cfg.dev);
-    goto done;
-  }
-#endif 
+    /* tell the raw IP socket that we plan to form our own IP headers */
+    ec = setsockopt(cfg.tx_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    if (ec < 0) {
+      fprintf(stderr,"setsockopt IP_HDRINCL: %s\n", strerror(errno));
+      goto done;
+    }
 
-  /* bind interface. doing this to imitate tcpreplay(1) */
-  /* using PACKET_HOST like tcpreplay; packet(7) says not needed */
-  /* setsockopt SO_BROADCAST like tcpreplay. again, necessary? */
-  struct sockaddr_ll sl;
-  memset(&sl, 0, sizeof(sl));
-  sl.sll_family = AF_PACKET;
-  sl.sll_protocol = protocol;
-  sl.sll_hatype = PACKET_HOST;
-  sl.sll_ifindex = cfg.dev_ifindex;
-  ec = bind(cfg.tx_fd, (struct sockaddr*)&sl, sizeof(sl));
-  if (ec < 0) {
-    fprintf(stderr,"socket: %s\n", strerror(errno));
-    goto done;
-  }
-  int one = 1;
-  ec = setsockopt(cfg.tx_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
-  if (ec < 0) {
-    fprintf(stderr,"setsockopt SO_BROADCAST: %s\n", strerror(errno));
-    goto done;
+  } else {
+
+    /* standard (NIX tx) transmit mode. lookup interface, bind to it. */
+    struct ifreq ifr;
+    strncpy(ifr.ifr_name, cfg.dev, sizeof(ifr.ifr_name));
+    ec = ioctl(cfg.tx_fd, SIOCGIFINDEX, &ifr);
+    if (ec < 0) {
+      fprintf(stderr,"failed to find interface %s\n", cfg.dev);
+      goto done;
+    }
+    cfg.dev_ifindex = ifr.ifr_ifindex;
+
+    /* bind interface. doing this to imitate tcpreplay(1) */
+    /* using PACKET_HOST like tcpreplay; packet(7) says not needed */
+    /* setsockopt SO_BROADCAST like tcpreplay. again, necessary? */
+    struct sockaddr_ll sl;
+    memset(&sl, 0, sizeof(sl));
+    sl.sll_family = AF_PACKET;
+    sl.sll_protocol = protocol;
+    sl.sll_hatype = PACKET_HOST;
+    sl.sll_ifindex = cfg.dev_ifindex;
+    ec = bind(cfg.tx_fd, (struct sockaddr*)&sl, sizeof(sl));
+    if (ec < 0) {
+      fprintf(stderr,"socket: %s\n", strerror(errno));
+      goto done;
+    }
+    ec = setsockopt(cfg.tx_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    if (ec < 0) {
+      fprintf(stderr,"setsockopt SO_BROADCAST: %s\n", strerror(errno));
+      goto done;
+    }
   }
 
   rc = 0;
@@ -375,6 +398,101 @@ int handle_signal(void) {
   return rc;
 }
 
+char gbuf[MAX_PKT];
+char *encapsulate(char *tx, ssize_t *nx) {
+  char *g = gbuf, *ethertype;
+  if (*nx < 14) return NULL;
+  uint32_t ip_src = 0;
+  uint32_t ip_dst = cfg.encap.dst.s_addr;
+  uint32_t seqno;
+  uint16_t encap_ethertype;
+
+  /* construct 20-byte IP header. 
+   * NOTE: some zeroed header fields are filled out for us, when we send this
+   * packet; particularly, checksum, src IP; ID and total length. see raw(7).
+   */
+  g[0] = 4 << 4;  /* IP version goes in MSB (upper 4 bits) of the first byte */
+  g[0] |= 5;      /* IP header length (5 * 4 = 20 bytes) in lower 4 bits */
+  g[1] = 0;       /* DSCP / ECN */
+  g[2] = 0;       /* total length (upper byte) (see NOTE) */
+  g[3] = 0;       /* total length (lower byte) (see NOTE) */
+  g[4] = 0;       /* datagam id (upper byte); for frag reassembly (see NOTE) */
+  g[5] = 0;       /* datagam id (lower byte); for frag reassembly (see NOTE) */
+  g[6] = 0;       /* flags and upper bits of frag offset */
+  g[7] = 0;       /* lower bits of frag offset */
+  g[8] = 255;     /* TTL */
+  g[9] = 47;      /* IP protocol GRE */
+  g[10] = 0;      /* IP checksum (high byte) (see NOTE) */
+  g[11] = 0;      /* IP checksum (low byte) (see NOTE) */
+  memcpy(&g[12], &ip_src, sizeof(ip_src)); /* IP source (see NOTE) */
+  memcpy(&g[16], &ip_dst, sizeof(ip_dst)); /* IP destination */
+
+  g += 20;
+
+  /* GRE header starts */
+
+  switch(cfg.encap.mode) {
+    case mode_gre:
+      memset(g, 0, 2);     /* zero first two bytes of GRE header */
+      g += 2;
+      ethertype = &tx[12]; /* copy ethertype from packet into GRE header */
+      memcpy(g, ethertype, sizeof(uint16_t));
+      g += 2;
+      *nx -= 14; tx += 14; // elide original MACs and ethertype!
+      assert(*nx <= sizeof(gbuf)-(g-gbuf)); /* TODO skip not assert */
+      memcpy(g, tx, *nx);
+      g += *nx;
+      *nx = g-gbuf;
+      break;
+    case mode_gretap:
+      memset(g, 0, 2);     /* zero first two bytes of GRE header */
+      g += 2;
+      encap_ethertype = htons(0x6558); /* transparent ethernet bridging */
+      memcpy(g, &encap_ethertype, sizeof(uint16_t));
+      g += 2;
+      assert(*nx <= sizeof(gbuf)-(g-gbuf)); /* TODO skip not assert */
+      memcpy(g, tx, *nx);
+      g += *nx;
+      *nx = g-gbuf;
+      break;
+    case mode_erspan:
+      g[0] = 1 << 4;  /* turn on GRE "S" bit to indicate sequence num option */
+      g[1] = 0;       /* zero next full byte of GRE header */
+      g += 2;
+      encap_ethertype = htons(0x88BE); /* ERSPAN type II */
+      memcpy(g, &encap_ethertype, sizeof(uint16_t));
+      g += 2;
+      seqno = htonl(cfg.encap.session_seqno++); /* GRE sequence number */
+      memcpy(g, &seqno, sizeof(uint32_t));
+      g += sizeof(uint32_t);
+      /* start ERSPAN Type 2 header (8 bytes) */
+      uint8_t cos = 0, t = 0;  /* TODO fill in with correct values */
+      g[0] = 1 << 4;   /* ERSPAN  version, 0x1 = Type II */
+      g[1] = 0;        /* lower 8 bits of the VLAN, we leave it in frame */
+      g[2] = cos << 5; /* class of service from original frame; do later */
+      g[2] |= 3 << 3;  /* trunk encap type 3 means preserved in frame */
+      g[2] |= t << 2;  /* truncation bit */
+      g[2] |= ((cfg.encap.session & 0x300) >> 8); /* MSB 2 bits of 10 */
+      g[3] = cfg.encap.session & 0xff;           /* LSB 8 bits of 10 */
+      g[4] = 0;        /* reserved MSB 8 of 12 bits */
+      g[5] = 0;        /* reserved LSB 4 of 12 bits, index bits 19-16 */
+      g[6] = 0;        /* index middle word; bits of 15-8 of index */
+      g[7] = 0;        /* index LSB word; bits 7-0 of index */
+      g += 8;
+      /* packet */
+      assert(*nx <= sizeof(gbuf)-(g-gbuf)); /* TODO truncate not assert */
+      memcpy(g, tx, *nx);
+      g += *nx;
+      *nx = g-gbuf;
+      break;
+    default:
+      assert(0);
+      break;
+  }
+
+  return gbuf;
+}
+
 /* inject four bytes to the ethernet frame with an 802.1q vlan tag.
  * note if this makes MTU exceeded it may result in sendto error */
 #define VLAN_LEN 4
@@ -468,6 +586,9 @@ int transmit_packet(void) {
   int rc=-1, n, nio;
   ssize_t nr,nt,nx;
   struct iovec *io;
+  struct sockaddr *dst = NULL;
+  socklen_t sz = 0;
+  struct sockaddr_in sin;
 
   do {
     
@@ -508,7 +629,22 @@ int transmit_packet(void) {
       /* trim N bytes from frame end if requested. */
       if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
 
-      nt = sendto(cfg.tx_fd, tx, nx, 0, NULL, 0);
+      /* wrap encapsulation around it, if enabled */
+      if (cfg.encap.enable) {
+        tx = encapsulate(tx,&nx);
+        if (tx == NULL) {
+          fprintf(stderr, "encapsulation failed\n");
+          goto done;
+        }
+
+        sin.sin_family = AF_INET;
+        sin.sin_port = 0;
+        sin.sin_addr = cfg.encap.dst;
+        dst = (struct sockaddr*)&sin;
+        sz = sizeof(sin);
+      }
+
+      nt = sendto(cfg.tx_fd, tx, nx, 0, dst, sz);
       if (nt != nx) {
         fprintf(stderr,"sendto: %s\n", (nt < 0) ? strerror(errno) : "partial");
         goto done;
@@ -718,6 +854,38 @@ size_t kmgt(char *optarg) {
  return size;
 }
 
+int parse_encap(char *opt) {
+  int rc = -1;
+  char *mode=opt,*dst=opt, *colon;
+
+  colon = strchr(mode,':');
+  if (colon == NULL) {
+    fprintf(stderr,"invalid encapsulation syntax\n");
+    goto done;
+  }
+  *colon = '\0';
+
+  if      (!strcmp(mode,"gre"))    cfg.encap.mode = mode_gre;
+  else if (!strcmp(mode,"gretap")) cfg.encap.mode = mode_gretap;
+  else if (!strcmp(mode,"erspan")) cfg.encap.mode = mode_erspan;
+  else { 
+    fprintf(stderr,"invalid encapsulation mode\n");
+    goto done;
+  }
+
+  dst = colon+1;
+
+  if (inet_aton(dst, &cfg.encap.dst) == 0) {
+    fprintf(stderr,"invalid ip: %s\n", dst);
+    goto done;
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
 int main(int argc, char *argv[]) {
   struct epoll_event ev;
   cfg.prog = argv[0];
@@ -732,14 +900,17 @@ int main(int argc, char *argv[]) {
   cfg.aux_fd = utvector_new(utmm_int);
   cfg.tee_bb = utvector_new(&bb_mm);
   utstring_new(cfg.tmp);
+  utmm_init(&bb_mm, &cfg.bb, 1);
+  utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TF")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') goto done; break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') goto done; break;
       case 'c': cfg.mode = mode_create;   if (*optarg != 'r') goto done; break;
       case 'T': cfg.mode = mode_tee; break;
       case 'F': cfg.mode = mode_funnel; break;
+      case 'E': cfg.encap.enable=1; if (parse_encap(optarg)) goto done; break;
       case 'v': cfg.verbose++; break;
       case 'V': cfg.vlan=atoi(optarg); break; 
       case 'D': cfg.tail=atoi(optarg); break; 
@@ -775,9 +946,6 @@ int main(int argc, char *argv[]) {
   /* add descriptors of interest */
   if (new_epoll(EPOLLIN, cfg.signal_fd)) goto done; // signals
 
-  /* establish the batch buffers */
-  utmm_init(&bb_mm, &cfg.bb, 1);
-  utmm_init(&bb_mm, &cfg.rb, 1);
 
   /* in transmit mode, epoll on the ring descriptor.
    * in receive mode, epoll on the raw socket.
@@ -793,7 +961,7 @@ int main(int argc, char *argv[]) {
       if (new_epoll(EPOLLIN, cfg.fd)) goto done;
       break;
     case mode_transmit:
-      if (cfg.dev == NULL) usage();
+      if ((cfg.dev == NULL) && (cfg.encap.enable == 0)) usage();
       ring_mode = SHR_RDONLY|SHR_NONBLOCK|SHR_SELECTFD;
       cfg.file = (optind < argc) ? argv[optind++] : NULL;
       cfg.ring = shr_open(cfg.file, ring_mode);
@@ -840,7 +1008,7 @@ int main(int argc, char *argv[]) {
       while (optind < argc) {
         file = argv[optind++];
         if (cfg.verbose) fprintf(stderr,"creating %s\n", file);
-        init_mode = SHR_OVERWRITE|SHR_MESSAGES|SHR_LRU_DROP;
+        init_mode = SHR_KEEPEXIST|SHR_MESSAGES|SHR_LRU_DROP;
         if (shr_init(file, cfg.size, init_mode) < 0) goto done;
       }
       rc = 0;
