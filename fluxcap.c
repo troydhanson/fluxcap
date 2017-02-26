@@ -70,6 +70,15 @@ struct {
   struct timeval now;
   struct bb bb; /* output batch buffer; accumulates output before shr_writev */
   struct bb rb; /* readv batch buffer; accepts many messages at once */
+  /* fields below are for packet input from AF_PACKET socket */
+  struct tpacket_req req; /* linux/if_packet.h */
+  unsigned ring_block_sz; /* see comments in initialization below */
+  unsigned ring_block_nr; /* number of blocks of sz above */
+  unsigned ring_frame_sz; /* snaplen */
+  unsigned ring_curr_idx; /* slot index in ring buffer */
+  unsigned ring_frame_nr; /* redundant, total frame count */
+  int losing;     /* packets loss since last reset (boolean) */
+  int strip_vlan; /* strip VLAN on rx if present (boolean) */
 } cfg = {
   .bb.n = BATCH_SIZE,
   .rb.n = BATCH_SIZE,
@@ -77,6 +86,9 @@ struct {
   .tx_fd = -1,
   .signal_fd = -1,
   .epoll_fd = -1,
+  .ring_block_sz = 1 << 22, /*4 mb; want powers of two due to kernel allocator*/
+  .ring_block_nr = 64,
+  .ring_frame_sz = 1 << 11, /* 2048 for MTU & header, divisor of ring_block_sz*/
 };
 
 /*
@@ -135,13 +147,6 @@ void usage() {
                  " tee-out:        -T <src-ring> <dst-ring> ...\n"
                  " funnel-in:      -F <dst-ring> <src-ring> ...\n"
                  "\n"
-                 "additional tx/rx options:\n"
-                 "\n"
-                 "           -V <vlan>     (inject VLAN tag)\n"
-                 "           -s <size>     (snaplen)\n"
-                 "           -D <n>        (trim n tail bytes)\n"
-                 "           -v            (verbose)\n"
-                 "\n"
                  "  <size> may have k/m/g/t suffix\n"
                  "\n"
                  "encapsulation modes (tx-only):\n"
@@ -149,6 +154,24 @@ void usage() {
                  "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
                  "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation)\n"
                  "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation)\n"
+                 "\n"
+                 "other options:\n"
+                 "\n"
+                 "    -V <vlan>    (inject VLAN tag) [rx/tee/tx]\n"
+                 "    -Q           (strip VLAN tag) [rx]\n"
+                 "    -s <size>    (snaplen- truncate at this size)\n"
+                 "    -D <n>       (trim n tail bytes)\n"
+                 "    -v           (verbose)\n"
+                 "\n"
+                 " VLAN tags may be stripped (-Q) on rx,\n"
+                 "  or replaced/inserted (-V <1-4095>) on rx,\n"
+                 "  or inserted (-V <1-4095>) on tee/tx,\n"
+                 "  or left intact (default).\n"
+                 "\n"
+                 " Kernel ring buffer options (PACKET_RX_RING TPACKET_V2)\n"
+                 " -B <num-blocks>      -packet ring num-blocks e.g. 64\n"
+                 " -S <log2-block-size> -log2 packet ring block size (e.g. 22 = 4mb)\n"
+                 " -Z <frame-size>      -max frame (packet + header) size (e.g. 2048)\n"
                  "\n",
           cfg.prog);
   exit(-1);
@@ -168,8 +191,53 @@ int new_epoll(int events, int fd) {
   return rc;
 }
 
+/* 
+ * Prepare to read packets using a AF_PACKET socket with PACKET_RX_RING
+ * 
+ * see packet(7)
+ *
+ * also see
+ *  sudo apt-get install linux-doc
+ *  zless /usr/share/doc/linux-doc/networking/packet_mmap.txt.gz
+ *
+ * With PACKET_RX_RING (in version TPACKET_V1 and TPACKET_V2)
+ * the ring buffer consists of an array of packet slots.
+ * Each slot is of size tp_snaplen.
+ * Each packet is preceded by a metadata structure in the slot.
+ * The application and kernel communicate the head and tail of
+ * the ring through tp_status field (TP_STATUS_[USER|KERNEL]).
+ *
+ * the packet ring's mmap'd region is comprised of blocks filled with packets. 
+ * in our memory space it's a regular mapped region; in kernel space
+ * it is a number of discrete blocks. hence the description of the ring as 
+ * blocks - see tpacket_req initialization in setup_rx
+ *
+ *
+ */
+
 int setup_rx(void) {
   int rc=-1, ec;
+
+  /* sanity checks on allowable parameters. */
+  if (cfg.ring_block_sz % cfg.ring_frame_sz) {
+    fprintf(stderr,"-S block_sz must be multiple of -F frame_sz\n");
+    goto done;
+  }
+  unsigned page_sz = (unsigned)sysconf(_SC_PAGESIZE);
+  if (cfg.ring_block_sz % page_sz) {
+    fprintf(stderr,"-S block_sz must be multiple of page_sz %u\n", page_sz);
+    goto done;
+  }
+  if (cfg.ring_frame_sz <= TPACKET2_HDRLEN) {
+    fprintf(stderr,"-Z frame_sz must exceed %lu\n", TPACKET2_HDRLEN);
+    goto done;
+  }
+  if (cfg.ring_frame_sz % TPACKET_ALIGNMENT) {
+    fprintf(stderr,"-Z frame_sz must be a mulitple of %u\n", TPACKET_ALIGNMENT);
+    goto done;
+  }
+
+  cfg.ring_frame_nr = (cfg.ring_block_sz*cfg.ring_block_nr) / cfg.ring_frame_sz;
 
   /* any link layer protocol packets (linux/if_ether.h) */
   int protocol = htons(ETH_P_ALL);
@@ -187,6 +255,42 @@ int setup_rx(void) {
   ec = ioctl(cfg.fd, SIOCGIFINDEX, &ifr);
   if (ec < 0) {
     fprintf(stderr,"failed to find interface %s\n", cfg.dev);
+    goto done;
+  }
+
+  /* PACKET_RX_RING comes in multiple versions. TPACKET_V2 is used here */
+  int v = TPACKET_V2;
+  ec = setsockopt(cfg.fd, SOL_PACKET, PACKET_VERSION, &v, sizeof(v));
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_VERSION: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* fill out the struct tpacket_req describing the ring buffer */
+  memset(&cfg.req, 0, sizeof(cfg.req));
+  cfg.req.tp_block_size = cfg.ring_block_sz; /* Min sz of contig block */
+  cfg.req.tp_frame_size = cfg.ring_frame_sz; /* Size of frame/snaplen */
+  cfg.req.tp_block_nr = cfg.ring_block_nr;   /* Number of blocks */
+  cfg.req.tp_frame_nr = cfg.ring_frame_nr;   /* Total number of frames */
+  fprintf(stderr, "setting up PACKET_RX_RING:\n"
+                  " RING: (%u blocks * %u bytes per block) = %u bytes (%u MB)\n"
+                  " PACKETS: @(%u bytes/packet) = %u packets\n",
+                 cfg.ring_block_nr, cfg.ring_block_sz,
+                 cfg.ring_block_nr * cfg.ring_block_sz,
+                 cfg.ring_block_nr * cfg.ring_block_sz / (1024 * 1024),
+                 cfg.ring_frame_sz, cfg.ring_frame_nr);
+  ec = setsockopt(cfg.fd, SOL_PACKET, PACKET_RX_RING, &cfg.req, sizeof(cfg.req));
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_RX_RING: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* now map the ring buffer we described above. lock in unswappable memory */
+  cfg.rb.n = cfg.req.tp_block_size * cfg.req.tp_block_nr;
+  cfg.rb.d = mmap(NULL, cfg.rb.n, PROT_READ|PROT_WRITE,
+                      MAP_SHARED|MAP_LOCKED, cfg.fd, 0);
+  if (cfg.rb.d == MAP_FAILED) {
+    fprintf(stderr,"mmap: %s\n", strerror(errno));
     goto done;
   }
 
@@ -213,15 +317,6 @@ int setup_rx(void) {
     goto done;
   }
 
-  
-  /* enable ancillary data, providing packet length and snaplen, 802.1Q, etc */
-  int on = 1;
-  ec = setsockopt(cfg.fd, SOL_PACKET, PACKET_AUXDATA, &on, sizeof(on));
-  if (ec < 0) {
-    fprintf(stderr,"setsockopt PACKET_AUXDATA: %s\n", strerror(errno));
-    goto done;
-  }
-
   rc = 0;
 
  done:
@@ -243,18 +338,14 @@ int setup_tx(void) {
     goto done;
   }
 
-  if (cfg.encap.enable) {
-
-    /* tell the raw IP socket that we plan to form our own IP headers */
+  if (cfg.encap.enable) { /* tell raw socket that we'll form IP headers */
     ec = setsockopt(cfg.tx_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     if (ec < 0) {
       fprintf(stderr,"setsockopt IP_HDRINCL: %s\n", strerror(errno));
       goto done;
     }
 
-  } else {
-
-    /* standard (NIX tx) transmit mode. lookup interface, bind to it. */
+  } else { /* standard tx mode. lookup interface, bind to it. */
     struct ifreq ifr;
     strncpy(ifr.ifr_name, cfg.dev, sizeof(ifr.ifr_name));
     ec = ioctl(cfg.tx_fd, SIOCGIFINDEX, &ifr);
@@ -359,6 +450,24 @@ int periodic_work(void) {
 
       break;
     case mode_receive:
+      if (cfg.losing) {
+        fprintf(stderr,"packets lost\n");
+        cfg.losing = 0;
+      }
+      struct tpacket_stats stats;  /* see /usr/include/linux/if_packet.h */
+      socklen_t len = sizeof(stats);
+
+      int ec = getsockopt(cfg.fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
+      if (ec < 0) {
+        fprintf(stderr,"getsockopt PACKET_STATISTICS: %s\n", strerror(errno));
+        goto done;
+      }
+
+      if (cfg.verbose) {
+        fprintf(stderr, "Received packets: %u\n", stats.tp_packets);
+        fprintf(stderr, "Dropped packets:  %u\n", stats.tp_drops);
+      }
+      /* FALL THROUGH */
     case mode_funnel:
       if (bb_flush(cfg.ring, &cfg.bb) < 0) goto done;
       break;
@@ -499,11 +608,11 @@ char *encapsulate(char *tx, ssize_t *nx) {
 char buf[MAX_PKT];
 char vlan_tag[VLAN_LEN] = {0x81, 0x00, 0x00, 0x00};
 #define MACS_LEN (2*6)
-char *inject_vlan(char *tx, ssize_t *nx) {
+char *inject_vlan(char *tx, ssize_t *nx, uint16_t vlan) {
   if (((*nx) + 4) > MAX_PKT) return NULL;
   if ((*nx) <= MACS_LEN) return NULL;
   /* prepare 802.1q tag vlan portion in network order */
-  uint16_t v = htons(cfg.vlan);
+  uint16_t v = htons(vlan);
   memcpy(&vlan_tag[2], &v, sizeof(v));
   /* copy MAC's from original packet, inject 802.1q, copy packet */
   memcpy(buf,                   tx,            MACS_LEN);
@@ -547,7 +656,7 @@ int tee_packet(void) {
       nx = io->iov_len;        /* length */
 
       /* inject 802.1q tag if requested */
-      if (cfg.vlan) tx = inject_vlan(tx,&nx);
+      if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
       if (tx == NULL) {
         fprintf(stderr, "vlan tag injection failed\n");
         goto done;
@@ -617,7 +726,7 @@ int transmit_packet(void) {
       nx = io->iov_len;        /* length */
 
       /* inject 802.1q tag if requested */
-      if (cfg.vlan) tx = inject_vlan(tx,&nx);
+      if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
       if (tx == NULL) {
         fprintf(stderr, "vlan tag injection failed\n");
         goto done;
@@ -662,79 +771,61 @@ int transmit_packet(void) {
   return rc;
 }
 
-int receive_packet(void) {
-  int rc=-1, sw;
+/* plow through the ready packets in the packet ring shared with kernel */
+int receive_packets(void) {
+  int rc=-1, sw, wire_vlan, form_vlan;
   ssize_t nr,nt,nx;
-
-  struct tpacket_auxdata *pa; /* for PACKET_AUXDATA; see packet(7) */
-  struct cmsghdr *cmsg;
-  struct {
-    struct cmsghdr h;
-    struct tpacket_auxdata a;
-  } u;
-
-  /* we get the packet and metadata via recvmsg */
-  struct msghdr msgh;
-  memset(&msgh, 0, sizeof(msgh));
-
-  /* ancillary data; we requested packet metadata (PACKET_AUXDATA) */
-  msgh.msg_control = &u;
-  msgh.msg_controllen = sizeof(u);
-
   struct iovec iov;
-  iov.iov_base = cfg.pkt;
-  iov.iov_len = MAX_PKT;
-  msgh.msg_iov = &iov;
-  msgh.msg_iovlen = 1;
+  char *tx;
 
-  nr = recvmsg(cfg.fd, &msgh, 0);
-  if (nr <= 0) {
-    fprintf(stderr,"recvmsg: %s\n", nr ? strerror(errno) : "eof");
-    goto done;
-  }
+  while (1) {
 
-  if (cfg.verbose) fprintf(stderr,"received %lu bytes of message data\n", (long)nr);
-  if (cfg.verbose) fprintf(stderr,"received %lu bytes of control data\n", (long)msgh.msg_controllen);
-  cmsg = CMSG_FIRSTHDR(&msgh);
-  if (cmsg == NULL) {
-    fprintf(stderr,"ancillary data missing from packet\n");
-    goto done;
-  }
-  pa = (struct tpacket_auxdata*)CMSG_DATA(cmsg);
-  if (cfg.verbose) fprintf(stderr, " packet length  %u\n", pa->tp_len);
-  if (cfg.verbose) fprintf(stderr, " packet snaplen %u\n", pa->tp_snaplen);
-  int losing = (pa->tp_status & TP_STATUS_LOSING) ? 1 : 0; 
-  if (losing) fprintf(stderr, " warning; losing\n");
-  int has_vlan = (pa->tp_status & TP_STATUS_VLAN_VALID) ? 1 : 0; 
-  if (cfg.verbose) fprintf(stderr, " packet has vlan %c\n", has_vlan ? 'Y' : 'N');
-  if (has_vlan) {
-    uint16_t vlan_tci = pa->tp_vlan_tci;
-    uint16_t tci = vlan_tci;
-    uint16_t vid = tci & 0xfff; // vlan VID is in the low 12 bits of the TCI
-    if (cfg.verbose) fprintf(stderr, " packet vlan %d\n", vid);
-    cfg.vlan = vid;
-  }
+    /* get address of the current slot (metadata header, pad, packet) */
+    uint8_t *cur = cfg.rb.d + cfg.ring_curr_idx * cfg.ring_frame_sz;
 
-  /* inject 802.1q tag if requested */
-  char *tx = cfg.pkt;
-  nx = nr;
-  if (cfg.vlan) tx = inject_vlan(tx,&nx);
-  if (tx == NULL) {
-    fprintf(stderr, "vlan tag injection failed\n");
-    goto done;
-  }
+    /* struct tpacket2_hdr is defined in /usr/include/linux/if_packet.h */
+    struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)cur;
 
-  /* truncate outgoing packet if requested */
-  if (cfg.size && (nx > cfg.size)) nx = cfg.size;
+    /* check if the packet is ready. this is how we break the loop */
+    if ((hdr->tp_status & TP_STATUS_USER) == 0) break;
 
-  /* trim N bytes from frame end if requested. */
-  if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
+    /* note packet drop condition */
+    if (hdr->tp_status & TP_STATUS_LOSING) cfg.losing=1;
 
-  /* push into batch buffer */
-  sw = bb_write(cfg.ring, &cfg.bb, tx, nx);
-  if (sw < 0) {
-    fprintf(stderr, "bb_write (%lu bytes): error code %d\n", (long)nx, sw);
-    goto done;
+    tx = cur + hdr->tp_mac;
+    nx = hdr->tp_snaplen;
+
+    /* upon receipt the wire vlan (if any) has been pulled out for us */
+    wire_vlan = (hdr->tp_status & TP_STATUS_VLAN_VALID) ? 
+                (hdr->tp_vlan_tci & 0xfff) : 0;
+    form_vlan = cfg.vlan ? cfg.vlan : wire_vlan;
+    if (cfg.strip_vlan) form_vlan = 0;
+
+    /* inject 802.1q tag if requested */
+    if (form_vlan) tx = inject_vlan(tx,&nx,form_vlan);
+    if (tx == NULL) {
+      fprintf(stderr, "vlan tag injection failed\n");
+      goto done;
+    }
+
+    /* truncate outgoing packet if requested */
+    if (cfg.size && (nx > cfg.size)) nx = cfg.size;
+
+    /* trim N bytes from frame end if requested. */
+    if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
+
+    /* push into batch buffer */
+    sw = bb_write(cfg.ring, &cfg.bb, tx, nx);
+    if (sw < 0) {
+      fprintf(stderr, "bb_write (%lu bytes): error code %d\n", (long)nx, sw);
+      goto done;
+    }
+
+    /* return the packet by assigning status word TP_STATUS_KERNEL (0) */
+    hdr->tp_status = TP_STATUS_KERNEL;
+
+    /* next packet */
+    cfg.ring_curr_idx = (cfg.ring_curr_idx + 1) % cfg.ring_frame_nr;
   }
 
   rc = 0;
@@ -806,7 +897,7 @@ int handle_io(void) {
 
   switch(cfg.mode) {
     case mode_receive:
-      rc = receive_packet();
+      rc = receive_packets();
       break;
     case mode_transmit:
       rc = transmit_packet();
@@ -903,7 +994,7 @@ int main(int argc, char *argv[]) {
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Q")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') goto done; break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') goto done; break;
@@ -915,9 +1006,13 @@ int main(int argc, char *argv[]) {
       case 'V': cfg.vlan=atoi(optarg); break; 
       case 'D': cfg.tail=atoi(optarg); break; 
       case 's': cfg.size = kmgt(optarg); break;
-      case 'h': default: usage(); break;
       case 'i': if (strlen(optarg) < MAX_NIC) strncpy(cfg.dev, optarg, MAX_NIC);
                 break;
+      case 'B': cfg.ring_block_nr=atoi(optarg); break;
+      case 'S': cfg.ring_block_sz = 1 << (unsigned)atoi(optarg); break;
+      case 'Z': cfg.ring_frame_sz=atoi(optarg); break;
+      case 'Q': cfg.strip_vlan = 1; break;
+      case 'h': default: usage(); break;
     }
   }
 
