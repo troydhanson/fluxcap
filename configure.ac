@@ -14,5 +14,8 @@ AC_CHECK_LIB(ncurses,initscr,
 AC_CONFIG_FILES([Makefile
    util/Makefile
    lib/Makefile
-   lib/shr/Makefile])
+   lib/shr/Makefile
+   lib/shr/src/Makefile
+   lib/shr/util/Makefile
+   ])
 AC_OUTPUT
