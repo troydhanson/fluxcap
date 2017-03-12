@@ -22,7 +22,7 @@
  * fluxcap: a network tap replication and aggregation tool
  *
  */
-#define FLUXCAP_VERSION "1.1"
+#define FLUXCAP_VERSION "1.2"
 #define MAX_PKT 100000         /* max length of packet */
 #define MAX_NIC 64             /* longest NIC name we accept */
 #define BATCH_SIZE (1024*1024) /* bytes buffered before shr_writev */
@@ -629,61 +629,57 @@ int tee_packet(void) {
   struct bb *b;
   struct iovec *io;
 
-  do {
-    
-    /* get pointers and lengths for the iov vector */
-    utvector_clear(cfg.rb.iov);
-    nio = cfg.rb.iov->n;
-    io = (struct iovec*)cfg.rb.iov->d;
+  /* get pointers and lengths for the iov vector */
+  utvector_clear(cfg.rb.iov);
+  nio = cfg.rb.iov->n;
+  io = (struct iovec*)cfg.rb.iov->d;
 
-    /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
-    nr = shr_readv(cfg.ring, cfg.rb.d, cfg.rb.n, io, &nio);
-    if (nr < 0) {
-      fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
+  /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
+  nr = shr_readv(cfg.ring, cfg.rb.d, cfg.rb.n, io, &nio);
+  if (nr < 0) {
+    fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
+    goto done;
+  }
+
+  /* record in vector number of used iov slots */
+  if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
+  assert(nio <= cfg.rb.iov->n);
+  cfg.rb.iov->i = nio;
+
+  /* iterate over packets obtained in shr_readv */
+  io = NULL;
+  while ( (io = utvector_next(cfg.rb.iov, io))) {
+
+    char *tx = io->iov_base; /* packet */
+    nx = io->iov_len;        /* length */
+
+    /* inject 802.1q tag if requested */
+    if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
+    if (tx == NULL) {
+      fprintf(stderr, "vlan tag injection failed\n");
       goto done;
     }
 
-    /* record in vector number of used iov slots */
-    if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
-    assert(nio <= cfg.rb.iov->n);
-    cfg.rb.iov->i = nio;
+    /* truncate outgoing packet if requested */
+    if (cfg.size && (nx > cfg.size)) nx = cfg.size;
 
-    /* iterate over packets obtained in shr_readv */
-    io = NULL;
-    while ( (io = utvector_next(cfg.rb.iov, io))) {
+    /* trim N bytes from frame end if requested. */
+    if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
 
-      char *tx = io->iov_base; /* packet */
-      nx = io->iov_len;        /* length */
+    r = NULL;
+    b = NULL;
+    while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r)) != NULL) {
+      b = (struct bb*)utvector_next(cfg.tee_bb, b); 
+      assert(b);
 
-      /* inject 802.1q tag if requested */
-      if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
-      if (tx == NULL) {
-        fprintf(stderr, "vlan tag injection failed\n");
+      nt = bb_write(*r, b, tx, nx);
+      if (nt < 0) {
+        fprintf(stderr, "bb_write error %ld\n", (long)nt);
         goto done;
       }
-
-      /* truncate outgoing packet if requested */
-      if (cfg.size && (nx > cfg.size)) nx = cfg.size;
-
-      /* trim N bytes from frame end if requested. */
-      if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
-
-      r = NULL;
-      b = NULL;
-      while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r)) != NULL) {
-        b = (struct bb*)utvector_next(cfg.tee_bb, b); 
-        assert(b);
-
-        nt = bb_write(*r, b, tx, nx);
-        if (nt < 0) {
-          fprintf(stderr, "bb_write error %ld\n", (long)nt);
-          goto done;
-        }
-      }
-
     }
 
-  } while (nr > 0);  /* n == 0 --> would block */
+  }
 
   rc = 0;
 
@@ -699,71 +695,67 @@ int transmit_packet(void) {
   socklen_t sz = 0;
   struct sockaddr_in sin;
 
-  do {
-    
-    /* get pointers and lengths for the iov vector */
-    utvector_clear(cfg.rb.iov);
-    nio = cfg.rb.iov->n;
-    io = (struct iovec*)cfg.rb.iov->d;
+  /* get pointers and lengths for the iov vector */
+  utvector_clear(cfg.rb.iov);
+  nio = cfg.rb.iov->n;
+  io = (struct iovec*)cfg.rb.iov->d;
 
-    /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
-    nr = shr_readv(cfg.ring, cfg.rb.d, cfg.rb.n, io, &nio);
-    if (nr < 0) {
-      fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
+  /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
+  nr = shr_readv(cfg.ring, cfg.rb.d, cfg.rb.n, io, &nio);
+  if (nr < 0) {
+    fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
+    goto done;
+  }
+
+  /* record in vector number of used iov slots */
+  if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
+  assert(nio <= cfg.rb.iov->n);
+  cfg.rb.iov->i = nio;
+
+  /* iterate over packets obtained in shr_readv */
+  io = NULL;
+  while ( (io = utvector_next(cfg.rb.iov, io))) {
+
+    char *tx = io->iov_base; /* packet */
+    nx = io->iov_len;        /* length */
+
+    /* inject 802.1q tag if requested */
+    if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
+    if (tx == NULL) {
+      fprintf(stderr, "vlan tag injection failed\n");
       goto done;
     }
 
-    /* record in vector number of used iov slots */
-    if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
-    assert(nio <= cfg.rb.iov->n);
-    cfg.rb.iov->i = nio;
+    /* truncate outgoing packet if requested */
+    if (cfg.size && (nx > cfg.size)) nx = cfg.size;
 
-    /* iterate over packets obtained in shr_readv */
-    io = NULL;
-    while ( (io = utvector_next(cfg.rb.iov, io))) {
+    /* trim N bytes from frame end if requested. */
+    if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
 
-      char *tx = io->iov_base; /* packet */
-      nx = io->iov_len;        /* length */
-
-      /* inject 802.1q tag if requested */
-      if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
+    /* wrap encapsulation around it, if enabled */
+    if (cfg.encap.enable) {
+      tx = encapsulate(tx,&nx);
       if (tx == NULL) {
-        fprintf(stderr, "vlan tag injection failed\n");
+        fprintf(stderr, "encapsulation failed\n");
         goto done;
       }
 
-      /* truncate outgoing packet if requested */
-      if (cfg.size && (nx > cfg.size)) nx = cfg.size;
-
-      /* trim N bytes from frame end if requested. */
-      if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
-
-      /* wrap encapsulation around it, if enabled */
-      if (cfg.encap.enable) {
-        tx = encapsulate(tx,&nx);
-        if (tx == NULL) {
-          fprintf(stderr, "encapsulation failed\n");
-          goto done;
-        }
-
-        sin.sin_family = AF_INET;
-        sin.sin_port = 0;
-        sin.sin_addr = cfg.encap.dst;
-        dst = (struct sockaddr*)&sin;
-        sz = sizeof(sin);
-      }
-
-      nt = sendto(cfg.tx_fd, tx, nx, 0, dst, sz);
-      if (nt != nx) {
-        fprintf(stderr,"sendto: %s\n", (nt < 0) ? strerror(errno) : "partial");
-        goto done;
-      }
-
-      if (cfg.verbose) fprintf(stderr,"tx %ld byte packet\n", (long)nx);
-
+      sin.sin_family = AF_INET;
+      sin.sin_port = 0;
+      sin.sin_addr = cfg.encap.dst;
+      dst = (struct sockaddr*)&sin;
+      sz = sizeof(sin);
     }
 
-  } while (nr > 0);  /* n == 0 --> would block */
+    nt = sendto(cfg.tx_fd, tx, nx, 0, dst, sz);
+    if (nt != nx) {
+      fprintf(stderr,"sendto: %s\n", (nt < 0) ? strerror(errno) : "partial");
+      goto done;
+    }
+
+    if (cfg.verbose) fprintf(stderr,"tx %ld byte packet\n", (long)nx);
+
+  }
 
   rc = 0;
 
@@ -850,41 +842,37 @@ int funnel(int pos) {
   struct shr **r = (struct shr**)utvector_elt(cfg.aux_rings, pos);
   assert(r);
 
-  do {
-    
-    /* get pointers and lengths for the iov vector */
-    utvector_clear(cfg.rb.iov);
-    nio = cfg.rb.iov->n;
-    io = (struct iovec*)cfg.rb.iov->d;
+  /* get pointers and lengths for the iov vector */
+  utvector_clear(cfg.rb.iov);
+  nio = cfg.rb.iov->n;
+  io = (struct iovec*)cfg.rb.iov->d;
 
-    /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
-    nr = shr_readv(*r, cfg.rb.d, cfg.rb.n, io, &nio);
-    if (nr < 0) {
-      fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
+  /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
+  nr = shr_readv(*r, cfg.rb.d, cfg.rb.n, io, &nio);
+  if (nr < 0) {
+    fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
+    goto done;
+  }
+
+  /* record in vector number of used iov slots */
+  if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
+  assert(nio <= cfg.rb.iov->n);
+  cfg.rb.iov->i = nio;
+
+  /* iterate over packets obtained in shr_readv */
+  io = NULL;
+  while ( (io = utvector_next(cfg.rb.iov, io))) {
+
+    char *pkt = io->iov_base; /* packet */
+    size_t len = io->iov_len; /* length */
+
+    /* funnel it into the output ring */
+    wr = bb_write(cfg.ring, &cfg.bb, pkt, len);
+    if (wr < 0) {
+      fprintf(stderr, "bb_write: error code %ld\n", (long)wr);
       goto done;
     }
-
-    /* record in vector number of used iov slots */
-    if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
-    assert(nio <= cfg.rb.iov->n);
-    cfg.rb.iov->i = nio;
-
-    /* iterate over packets obtained in shr_readv */
-    io = NULL;
-    while ( (io = utvector_next(cfg.rb.iov, io))) {
-
-      char *pkt = io->iov_base; /* packet */
-      size_t len = io->iov_len; /* length */
-
-      /* funnel it into the output ring */
-      wr = bb_write(cfg.ring, &cfg.bb, pkt, len);
-      if (wr < 0) {
-        fprintf(stderr, "bb_write: error code %ld\n", (long)wr);
-        goto done;
-      }
-    }
-
-  } while(nr > 0);
+  }
 
   rc = 0;
 
@@ -1057,7 +1045,7 @@ int main(int argc, char *argv[]) {
       break;
     case mode_transmit:
       if ((cfg.dev == NULL) && (cfg.encap.enable == 0)) usage();
-      ring_mode = SHR_RDONLY|SHR_NONBLOCK|SHR_SELECTFD;
+      ring_mode = SHR_RDONLY|SHR_NONBLOCK;
       cfg.file = (optind < argc) ? argv[optind++] : NULL;
       cfg.ring = shr_open(cfg.file, ring_mode);
       if (cfg.ring == NULL) goto done;
@@ -1073,7 +1061,7 @@ int main(int argc, char *argv[]) {
       if (cfg.ring == NULL) goto done;
       while (optind < argc) {
         file = argv[optind++];
-        r = shr_open(file, SHR_RDONLY|SHR_NONBLOCK|SHR_SELECTFD);
+        r = shr_open(file, SHR_RDONLY|SHR_NONBLOCK);
         if (r == NULL) goto done;
         utvector_push(cfg.aux_rings, &r);
         int fd = shr_get_selectable_fd(r);
@@ -1083,7 +1071,7 @@ int main(int argc, char *argv[]) {
       }
       break;
     case mode_tee:
-      ring_mode = SHR_RDONLY|SHR_NONBLOCK|SHR_SELECTFD;
+      ring_mode = SHR_RDONLY|SHR_NONBLOCK;
       cfg.file = (optind < argc) ? argv[optind++] : NULL;
       cfg.ring = shr_open(cfg.file, ring_mode);
       if (cfg.ring == NULL) goto done;
@@ -1103,7 +1091,7 @@ int main(int argc, char *argv[]) {
       while (optind < argc) {
         file = argv[optind++];
         if (cfg.verbose) fprintf(stderr,"creating %s\n", file);
-        init_mode = SHR_KEEPEXIST|SHR_MESSAGES|SHR_LRU_DROP;
+        init_mode = SHR_KEEPEXIST|SHR_MESSAGES|SHR_DROP;
         if (shr_init(file, cfg.size, init_mode) < 0) goto done;
       }
       rc = 0;
