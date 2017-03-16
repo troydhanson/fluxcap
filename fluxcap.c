@@ -79,6 +79,7 @@ struct {
   unsigned ring_frame_nr; /* redundant, total frame count */
   int losing;     /* packets loss since last reset (boolean) */
   int strip_vlan; /* strip VLAN on rx if present (boolean) */
+  int drop_pct;   /* sampling % 0 (keep all)-100(drop all) */
 } cfg = {
   .bb.n = BATCH_SIZE,
   .rb.n = BATCH_SIZE,
@@ -161,6 +162,7 @@ void usage() {
                  "    -Q           (strip VLAN tag) [rx]\n"
                  "    -s <size>    (snaplen- truncate at this size)\n"
                  "    -D <n>       (trim n tail bytes)\n"
+                 "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx]\n"
                  "    -v           (verbose)\n"
                  "\n"
                  " VLAN tags may be stripped (-Q) on rx,\n"
@@ -763,6 +765,14 @@ int transmit_packet(void) {
   return rc;
 }
 
+/* right now sampling is the only way we elect to drop a packet */
+int keep_packet(char *tx, size_t nx) {
+  if (cfg.drop_pct == 0) return 1;
+  int r = rand();
+  if ((r * 1.0 / RAND_MAX) < cfg.drop_pct) return 0;
+  return 1;
+}
+
 /* plow through the ready packets in the packet ring shared with kernel */
 int receive_packets(void) {
   int rc=-1, sw, wire_vlan, form_vlan;
@@ -806,8 +816,10 @@ int receive_packets(void) {
     /* trim N bytes from frame end if requested. */
     if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
 
+    int keep = keep_packet(tx,nx);
+
     /* push into batch buffer */
-    sw = bb_write(cfg.ring, &cfg.bb, tx, nx);
+    sw = keep ? bb_write(cfg.ring, &cfg.bb, tx, nx) : 0;
     if (sw < 0) {
       fprintf(stderr, "bb_write (%lu bytes): error code %d\n", (long)nx, sw);
       goto done;
@@ -982,14 +994,14 @@ int main(int argc, char *argv[]) {
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Q")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:")) != -1) {
     switch(opt) {
-      case 't': cfg.mode = mode_transmit; if (*optarg != 'x') goto done; break;
-      case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') goto done; break;
-      case 'c': cfg.mode = mode_create;   if (*optarg != 'r') goto done; break;
+      case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
+      case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
+      case 'c': cfg.mode = mode_create;   if (*optarg != 'r') usage(); break;
       case 'T': cfg.mode = mode_tee; break;
       case 'F': cfg.mode = mode_funnel; break;
-      case 'E': cfg.encap.enable=1; if (parse_encap(optarg)) goto done; break;
+      case 'E': cfg.encap.enable=1; if (parse_encap(optarg)) usage(); break;
       case 'v': cfg.verbose++; break;
       case 'V': cfg.vlan=atoi(optarg); break; 
       case 'D': cfg.tail=atoi(optarg); break; 
@@ -1000,9 +1012,12 @@ int main(int argc, char *argv[]) {
       case 'S': cfg.ring_block_sz = 1 << (unsigned)atoi(optarg); break;
       case 'Z': cfg.ring_frame_sz=atoi(optarg); break;
       case 'Q': cfg.strip_vlan = 1; break;
+      case 'd': cfg.drop_pct=100-atoi(optarg); break;
       case 'h': default: usage(); break;
     }
   }
+
+  if ((cfg.drop_pct < 0) || (cfg.drop_pct > 100)) usage();
 
   sigset_t all;
   sigfillset(&all);
