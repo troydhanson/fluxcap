@@ -769,7 +769,7 @@ int transmit_packet(void) {
 int keep_packet(char *tx, size_t nx) {
   if (cfg.drop_pct == 0) return 1;
   int r = rand();
-  if ((r * 1.0 / RAND_MAX) < cfg.drop_pct) return 0;
+  if ((r * 100.0 / RAND_MAX) < cfg.drop_pct) return 0;
   return 1;
 }
 
