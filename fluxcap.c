@@ -162,7 +162,7 @@ void usage() {
                  "    -Q           (strip VLAN tag) [rx]\n"
                  "    -s <size>    (snaplen- truncate at this size)\n"
                  "    -D <n>       (trim n tail bytes)\n"
-                 "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx]\n"
+                 "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx/tx]\n"
                  "    -v           (verbose)\n"
                  "\n"
                  " VLAN tags may be stripped (-Q) on rx,\n"
@@ -689,6 +689,13 @@ int tee_packet(void) {
   return rc;
 }
 
+int keep_packet(char *tx, size_t nx) {
+  if (cfg.drop_pct == 0) return 1;
+  int r = rand();
+  if ((r * 100.0 / RAND_MAX) < cfg.drop_pct) return 0;
+  return 1;
+}
+
 int transmit_packet(void) {
   int rc=-1, n, nio;
   ssize_t nr,nt,nx;
@@ -720,6 +727,7 @@ int transmit_packet(void) {
 
     char *tx = io->iov_base; /* packet */
     nx = io->iov_len;        /* length */
+    if (keep_packet(tx, nx) == 0) continue;
 
     /* inject 802.1q tag if requested */
     if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
@@ -766,13 +774,6 @@ int transmit_packet(void) {
 }
 
 /* right now sampling is the only way we elect to drop a packet */
-int keep_packet(char *tx, size_t nx) {
-  if (cfg.drop_pct == 0) return 1;
-  int r = rand();
-  if ((r * 100.0 / RAND_MAX) < cfg.drop_pct) return 0;
-  return 1;
-}
-
 /* plow through the ready packets in the packet ring shared with kernel */
 int receive_packets(void) {
   int rc=-1, sw, wire_vlan, form_vlan;
