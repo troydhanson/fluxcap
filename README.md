@@ -59,8 +59,7 @@ On RHEL/CentOS:
 
 In the top-level fluxcap directory, run:
 
-    git submodule init
-    git submodule update
+    git submodule update --init --recursive
     ./autogen.sh
     ./configure
     make

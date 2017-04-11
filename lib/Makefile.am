@@ -7,11 +7,11 @@ SUBDIRS=shr
 noinst_LIBRARIES = libut.a libtpl.a
 
 libut_a_CFLAGS = -Wall -Wextra
-libut_a_CPPFLAGS = -I$(srcdir)/uthash/libut/include
-libut_a_SOURCES = uthash/libut/src/libut.c    \
-                  uthash/libut/src/utvector.c \
-                  uthash/libut/src/utmm.c     \
-                  uthash/libut/src/ringbuf.c
+libut_a_CPPFLAGS = -I$(srcdir)/libut/include
+libut_a_SOURCES = libut/src/libut.c    \
+                  libut/src/utvector.c \
+                  libut/src/utmm.c     \
+                  libut/src/ringbuf.c
 
 libtpl_a_CFLAGS = -Wall 
 libtpl_a_CPPFLAGS = -I$(srcdir)/tpl/src
