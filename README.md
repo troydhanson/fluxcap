@@ -57,6 +57,20 @@ On RHEL/CentOS:
 
 ## Build and install
 
+### libshr
+
+The libshr library must be built and installed prior to building fluxcap.
+
+    git clone https://github.com/troydhanson/shr.git
+    cd shr
+    autoreconf -ivf
+    ./configure
+    make
+    sudo make install
+    cd ..
+
+### fluxcap
+
 In the top-level fluxcap directory, run:
 
     git submodule update --init --recursive

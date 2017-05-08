@@ -1,6 +1,6 @@
 srcdir = @srcdir@
 
-SUBDIRS=shr
+SUBDIRS=
 
 # build these external libraries as convenience libs
 
