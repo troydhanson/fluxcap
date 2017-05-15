@@ -20,9 +20,13 @@
 #include "tpl.h"
 
 /* 
- *
+ * fluxtop
+ * 
+ * displays in/out/loss rates for the given ring(s) in a "top"-like manner
  * 
  */
+
+#define STAT_BUCKETS 10  /* number of samples over which rates are averaged */
 
 struct {
   int verbose;
@@ -33,9 +37,12 @@ struct {
   int signal_fd;
   int epoll_fd;
   struct shr *ring;
+  int stat_bkt;
   size_t size;
   UT_vector /* of ptr */ *aux_rings; 
   UT_vector /* of utstring */ *aux_names; 
+  UT_vector /* of struct shr_stat s[STAT_BUCKET] */ *stat; 
+  struct shr_stat s[STAT_BUCKETS];
   UT_string *tmp;
   UT_string *rates;
   struct timeval now;
@@ -48,19 +55,17 @@ struct {
   .epoll_fd = -1,
 };
 
+typedef struct shr_stat ring_trend[STAT_BUCKETS];
 UT_mm _utmm_ptr = {.sz = sizeof(void*)};
 UT_mm* utmm_ptr = &_utmm_ptr;
+UT_mm _utmm_shr_stat = {.sz = sizeof(ring_trend)};
+UT_mm* utmm_shr_stat = &_utmm_shr_stat;
 
 void usage() {
-  fprintf(stderr,"usage: %s [-m|-n] [options] <ring> ...\n"
+  fprintf(stderr,"usage: %s [-m|-r] <ring> [<ring> ...]\n"
                  "\n"
-                 " monitor:        -m <ring> ...\n"
-                 " no tty:         -n <ring> ...\n"
-                 "\n"
-                 "additional options:\n"
-                 "\n"
-                 "           -v           (verbose)\n"
-                 "\n"
+                 " -m  (ncurses mode; default)\n"
+                 " -r  (raw mode; print counters)\n"
                  "\n",
           cfg.prog);
   exit(-1);
@@ -109,13 +114,15 @@ char *format_rate(unsigned long bps) {
 
 int update_rates() {
   struct shr **r;
-  struct shr_stat stat;
+  struct shr_stat stat,sum,*sa,*ss;
   struct timeval ts;
-  int rc = -1, sc;
+  int rc = -1, sc, i, j;
   UT_string *n;
   char *s;
   unsigned long age;
   double bps_r, bps_w, bps_l;
+  struct timeval oldest;
+  ring_trend *t;
 
   utstring_clear(cfg.rates);
 
@@ -127,20 +134,48 @@ int update_rates() {
 
   r = NULL;
   n = NULL;
+  t = NULL;
   while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r)) != NULL) {
     n = (UT_string*)utvector_next(cfg.aux_names, n); assert(n);
+    t = (ring_trend*)utvector_next(cfg.stat, t); assert(t);
+    sa = *t;
     sc = shr_stat(*r, &stat, &cfg.now);
     if ( sc < 0) { fprintf(stderr, "shr_stat: error\n"); goto done; }
+
+    sa[cfg.stat_bkt] = stat; /* struct copy */
+
+    /* loop over the stats buckets, calculate aggregate totals */
+    memset(&sum,0,sizeof(sum));
+    memset(&oldest,0,sizeof(oldest));
+
+    /* advance through the slots, summing the counters */
+    i = (cfg.stat_bkt + 1 ) % STAT_BUCKETS;
+
+    for(j = 0; j < STAT_BUCKETS; j++) {
+        ss = &sa[(i+j)%STAT_BUCKETS];
+
+        /* when the ring is full, the oldest slot always follows the
+         * current (new sample) slot. but during early execution, when
+         * fewer than STAT_BUCKETS samples exist in the ring, we find
+         * the oldest slot by advancing until we find a non-empty one. */
+        if ((oldest.tv_sec == 0) && (ss->start.tv_sec != 0)) {
+          oldest = ss->start;
+        }
+
+        sum.bw += ss->bw;
+        sum.br += ss->br;
+        sum.mw += ss->mw;
+        sum.mr += ss->mr;
+        sum.md += ss->md;
+        sum.bd += ss->bd;
+    }
     
-    age = subtract_timeval(&cfg.now, &stat.start);
-    if (age < 0) continue;
-    if (age > 10000000) continue; /* too long stats window */
-    if (age < 10000) continue;    /* too short stats window */ 
+    age = subtract_timeval(&cfg.now, &oldest);
 
     /* calculate bit-per-second read and written, omitting frame headers */
-    bps_r = (stat.br - stat.mr * sizeof(size_t)) * 8.0 / age * MILLION;
-    bps_w = (stat.bw - stat.mw * sizeof(size_t)) * 8.0 / age * MILLION;
-    bps_l = (stat.bd - stat.md * sizeof(size_t)) * 8.0 / age * MILLION;
+    bps_r = (sum.br - sum.mr * sizeof(size_t)) * 8.0 * MILLION / age;
+    bps_w = (sum.bw - sum.mw * sizeof(size_t)) * 8.0 * MILLION / age;
+    bps_l = (sum.bd - sum.md * sizeof(size_t)) * 8.0 * MILLION / age;
     s = utstring_body(n);
     tpl_pack(tn, 1);
 
@@ -149,6 +184,8 @@ int update_rates() {
         stat.bw, stat.br, stat.mw, stat.mr, stat.md, stat.bd, stat.bn, stat.bu, stat.mu);
     */
   }
+
+  cfg.stat_bkt = (cfg.stat_bkt + 1) % STAT_BUCKETS;
 
   /* store a flat buffer encoding all the stats for all the rings */
   size_t needed;
@@ -305,13 +342,14 @@ int main(int argc, char *argv[]) {
 
   cfg.aux_rings = utvector_new(utmm_ptr);
   cfg.aux_names = utvector_new(utstring_mm);
+  cfg.stat = utvector_new(utmm_shr_stat);
   utstring_new(cfg.tmp);
   utstring_new(cfg.rates);
 
-  while ( (opt=getopt(argc,argv,"vhs:mn")) != -1) {
+  while ( (opt=getopt(argc,argv,"vhs:mr")) != -1) {
     switch(opt) {
       case 'm': cfg.mode = mode_monitor; break;
-      case 'n': cfg.mode = mode_notty; break;
+      case 'r': cfg.mode = mode_notty; break;
       case 'v': cfg.verbose++; break;
       case 'h': default: usage(); break;
       case 's':
@@ -366,6 +404,7 @@ int main(int argc, char *argv[]) {
     utstring_clear(cfg.tmp);
     utstring_printf(cfg.tmp, "%s", file);
     utvector_push(cfg.aux_names, cfg.tmp);
+    utvector_extend(cfg.stat);
     r = shr_open(file, SHR_RDONLY);
     if (r == NULL) goto done;
     utvector_push(cfg.aux_rings, &r);
@@ -380,6 +419,7 @@ int main(int argc, char *argv[]) {
     init_pair(1, COLOR_WHITE, COLOR_GREEN);
     getmaxyx(stdscr, cfg.rows, cfg.cols);
     curs_set(0); // cursor visibilty (0=hide; 1=normal)
+    clear();
     if (new_epoll(EPOLLIN, STDIN_FILENO)) goto done; /* keypress */
   }
 
@@ -403,6 +443,7 @@ done:
   p = NULL; while ( (p = utvector_next(cfg.aux_rings, p)) != NULL) shr_close(*p);
   utvector_free(cfg.aux_rings);
   utvector_free(cfg.aux_names);
+  utvector_free(cfg.stat);
   utstring_free(cfg.tmp);
   utstring_free(cfg.rates);
   if (cfg.mode == mode_monitor) endwin();

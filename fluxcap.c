@@ -15,6 +15,7 @@
 #include <net/ethernet.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <poll.h>
 #include "shr.h"
 #include "libut.h"
 
@@ -22,7 +23,7 @@
  * fluxcap: a network tap replication and aggregation tool
  *
  */
-#define FLUXCAP_VERSION "1.2"
+#define FLUXCAP_VERSION "1.3"
 #define MAX_PKT 100000         /* max length of packet */
 #define MAX_NIC 64             /* longest NIC name we accept */
 #define BATCH_SIZE (1024*1024) /* bytes buffered before shr_writev */
@@ -49,7 +50,6 @@ struct {
         mode_tee, mode_funnel} mode;
   char *file;
   char dev[MAX_NIC];
-  int dev_ifindex;
   int ticks;
   int vlan;
   int tail;
@@ -68,8 +68,9 @@ struct {
   UT_vector /* of struct bb */ *tee_bb; 
   UT_string *tmp;
   struct timeval now;
-  struct bb bb; /* output batch buffer; accumulates output before shr_writev */
-  struct bb rb; /* readv batch buffer; accepts many messages at once */
+  struct bb bb; /* output shr ring batch buffer; accumulates til shr_writev */
+  struct bb rb; /* input shr ring batch buffer; accepts many via shr_readv */
+  struct bb pb; /* packet buffer (Special); faux bb wrapping kernel ring */
   /* fields below are for packet input from AF_PACKET socket */
   struct tpacket_req req; /* linux/if_packet.h */
   unsigned ring_block_sz; /* see comments in initialization below */
@@ -80,6 +81,8 @@ struct {
   int losing;     /* packets loss since last reset (boolean) */
   int strip_vlan; /* strip VLAN on rx if present (boolean) */
   int drop_pct;   /* sampling % 0 (keep all)-100(drop all) */
+  int use_tx_ring; /* 0 = sendto-based tx; 1=packet mmap ring-based tx */
+  int keep_going_on_tx_err;  /* ignore tx errors from malformed packets */
 } cfg = {
   .bb.n = BATCH_SIZE,
   .rb.n = BATCH_SIZE,
@@ -139,44 +142,77 @@ int sigs[] = {SIGHUP,SIGTERM,SIGINT,SIGQUIT,SIGALRM};
 
 void usage() {
   fprintf(stderr,
-                 "fluxcap version " FLUXCAP_VERSION "\n"
-                 "usage: %s [-tx|-rx|-cr|-T|-F|-m] [options] <ring>\n"
-                 "\n"
-                 " transmit:       -tx -i <eth>  <ring>\n"
-                 " receive:        -rx -i <eth>  <ring>\n"
-                 " create ring:    -cr -s <size> <ring> ...\n"
-                 " tee-out:        -T <src-ring> <dst-ring> ...\n"
-                 " funnel-in:      -F <dst-ring> <src-ring> ...\n"
-                 "\n"
-                 "  <size> may have k/m/g/t suffix\n"
-                 "\n"
-                 "encapsulation modes (tx-only):\n"
-                 "\n"
-                 "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
-                 "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation)\n"
-                 "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation)\n"
-                 "\n"
-                 "other options:\n"
-                 "\n"
-                 "    -V <vlan>    (inject VLAN tag) [rx/tee/tx]\n"
-                 "    -Q           (strip VLAN tag) [rx]\n"
-                 "    -s <size>    (snaplen- truncate at this size)\n"
-                 "    -D <n>       (trim n tail bytes)\n"
-                 "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx/tx]\n"
-                 "    -v           (verbose)\n"
-                 "\n"
-                 " VLAN tags may be stripped (-Q) on rx,\n"
-                 "  or replaced/inserted (-V <1-4095>) on rx,\n"
-                 "  or inserted (-V <1-4095>) on tee/tx,\n"
-                 "  or left intact (default).\n"
-                 "\n"
-                 " Kernel ring buffer options (PACKET_RX_RING TPACKET_V2)\n"
-                 " -B <num-blocks>      -packet ring num-blocks e.g. 64\n"
-                 " -S <log2-block-size> -log2 packet ring block size (e.g. 22 = 4mb)\n"
-                 " -Z <frame-size>      -max frame (packet + header) size (e.g. 2048)\n"
-                 "\n",
+       "fluxcap version " FLUXCAP_VERSION "\n"
+       "\n"
+       "usage: %s [-tx|-rx|-cr|-T|-F|-m] [options] <ring>\n"
+       "\n"
+       " transmit:       -tx -i <eth>  <ring>\n"
+       " receive:        -rx -i <eth>  <ring>\n"
+       " create ring:    -cr -s <size> <ring> ...\n"
+       " tee-out:        -T <src-ring> <dst-ring> ...\n"
+       " funnel-in:      -F <dst-ring> <src-ring> ...\n"
+       "\n"
+       "  <size> may have k/m/g/t suffix\n"
+       "\n"
+       "encapsulation modes (tx-only):\n"
+       "\n"
+       "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
+       "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation)\n"
+       "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation)\n"
+       "\n"
+       "other options:\n"
+       "\n"
+       "    -V <vlan>    (inject VLAN tag) [rx/tee/tx]\n"
+       "    -Q           (strip VLAN tag) [rx]\n"
+       "    -s <size>    (snaplen- truncate at this size)\n"
+       "    -D <n>       (trim n tail bytes)\n"
+       "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx/tx]\n"
+       "    -K           (keep going/ignore tx errors) [tx]\n"
+       "    -R           (use tx ring instead of sendto-based tx) [tx]\n"
+       "    -v           (verbose)\n"
+       "\n"
+       " VLAN tags may be stripped (-Q) on rx,\n"
+       "  or replaced/inserted (-V <1-4095>) on rx,\n"
+       "  or inserted (-V <1-4095>) on tee/tx,\n"
+       "  or left intact (default).\n"
+       "\n"
+       " Kernel ring buffer options [rx/tx]\n"
+       "\n"
+       " -Z <frame-size>      (max frame size, e.g. 2048)\n"
+       " -B <num-blocks>      (number of blocks comprising ring, e.g. 64)\n"
+       " -S <block-size>      (block size, log2; e.g. 22 = 4mb)\n"
+       "\n"
+       "  Defaults apply if left unspecified. To use these options\n"
+       "  the block size must be a multiple of the system page size,\n"
+       "  and be small since it consumes physically contiguous pages.\n"
+       "  The number of blocks can be large. Their product is the ring\n"
+       "  capacity. The frame size must evenly divide the block size.\n"
+       "  The ring parameters are checked to satisfy these constraints.\n"
+       "  The frame size is for one packet (with overhead) so it should\n"
+       "  exceed the MTU for full packet handling without truncation.\n"
+       "\n",
           cfg.prog);
   exit(-1);
+}
+
+void hexdump(char *buf, size_t len) {
+  size_t i,n=0;
+  unsigned char c;
+  while(n < len) {
+    fprintf(stderr,"%08x ", (int)n);
+    for(i=0; i < 16; i++) {
+      c = (n+i < len) ? buf[n+i] : 0;
+      if (n+i < len) fprintf(stderr,"%.2x ", c);
+      else fprintf(stderr, "   ");
+    }
+    for(i=0; i < 16; i++) {
+      c = (n+i < len) ? buf[n+i] : ' ';
+      if (c < 0x20 || c > 0x7e) c = '.';
+      fprintf(stderr,"%c",c);
+    }
+    fprintf(stderr,"\n");
+    n += 16;
+  }
 }
 
 int new_epoll(int events, int fd) {
@@ -185,12 +221,89 @@ int new_epoll(int events, int fd) {
   memset(&ev,0,sizeof(ev)); // placate valgrind
   ev.events = events;
   ev.data.fd= fd;
-  if (cfg.verbose) fprintf(stderr,"adding fd %d to epoll\n", fd);
   rc = epoll_ctl(cfg.epoll_fd, EPOLL_CTL_ADD, fd, &ev);
   if (rc == -1) {
     fprintf(stderr,"epoll_ctl: %s\n", strerror(errno));
   }
   return rc;
+}
+
+int check_ring_parameters(void) {
+  int rc=-1;
+  unsigned page_sz;
+
+  if (cfg.ring_block_sz % cfg.ring_frame_sz) {
+    fprintf(stderr,"-S block_sz must be multiple of -F frame_sz\n");
+    goto done;
+  }
+
+  page_sz = (unsigned)sysconf(_SC_PAGESIZE);
+
+  if (cfg.ring_block_sz % page_sz) {
+    fprintf(stderr,"-S block_sz must be multiple of page_sz %u\n", page_sz);
+    goto done;
+  }
+
+  if (cfg.ring_frame_sz <= TPACKET2_HDRLEN) {
+    fprintf(stderr,"-Z frame_sz must exceed %lu\n", TPACKET2_HDRLEN);
+    goto done;
+  }
+
+  if (cfg.ring_frame_sz % TPACKET_ALIGNMENT) {
+    fprintf(stderr,"-Z frame_sz must be a multiple of %u\n", TPACKET_ALIGNMENT);
+    goto done;
+  }
+
+  cfg.ring_frame_nr = (cfg.ring_block_sz / cfg.ring_frame_sz) * cfg.ring_block_nr;
+
+  rc = 0;
+ 
+ done:
+  return rc;
+
+}
+
+/* print the ring capacity in MB and packets 
+ *
+ * here in userspace, the ring is nothing but a regular flat buffer.
+ * it is comprised of contiguous slots - all of which have the same size.
+ *
+ * in kernel space, the ring is a set of blocks; each block is a number of
+ * physically contiguous pages. since physically contiguous pages are
+ * limited, the kernel only gets small allocations of them. it forms the
+ * blocks into a virtually contiguous buffer for our benefit in user space.
+ *
+ * these kernel memory considerations are why the ring is specified as
+ * a number of blocks (cfg.ring_block_nr) of a given size (cfg.ring_block_sz).
+ * the other parameter (cfg.ring_frame_sz) is the max size of a packet structure
+ * (struct tpacket_hdr, struct sockaddr_ll, packet itself, and padding). so
+ * to deal with full packet data it needs to be the MTU plus all that overhead.
+ *
+ * we require block size to be a multiple of frame size, so there are no gaps
+ * in the userspace view of the packet ring. it is a simple array of slots.
+ *
+ */
+void describe_ring(char *label) {
+
+  double block_size_mb = cfg.ring_block_sz / (1024.0 * 1024);
+  double mb = cfg.ring_block_nr * block_size_mb;
+
+  fprintf(stderr, "%s: %.1f megabytes (max %u packets)\n",
+     label, mb, cfg.ring_frame_nr);
+
+  if (cfg.verbose) {
+
+    double bps = 10000000000.0; /* 10 gigabit/sec network */
+    double mbytes_per_sec = bps / ( 8 * 1024 * 1024);
+    double sec = mb / mbytes_per_sec;
+
+    fprintf(stderr,
+       " RING: (%u blocks * %u bytes per block) = %.1f megabytes\n"
+       " PACKETS: @(%u bytes/packet) = %u packets\n"
+       " TIME TO QUENCH @ 10Gigabit/s: %.1f seconds\n",
+       cfg.ring_block_nr, cfg.ring_block_sz, mb,
+       cfg.ring_frame_sz, cfg.ring_frame_nr, sec);
+  }
 }
 
 /* 
@@ -202,44 +315,19 @@ int new_epoll(int events, int fd) {
  *  sudo apt-get install linux-doc
  *  zless /usr/share/doc/linux-doc/networking/packet_mmap.txt.gz
  *
- * With PACKET_RX_RING (in version TPACKET_V1 and TPACKET_V2)
+ * With PACKET_RX_RING (in TPACKET_V2)
  * the ring buffer consists of an array of packet slots.
- * Each slot is of size tp_snaplen.
+ *
  * Each packet is preceded by a metadata structure in the slot.
  * The application and kernel communicate the head and tail of
  * the ring through tp_status field (TP_STATUS_[USER|KERNEL]).
- *
- * the packet ring's mmap'd region is comprised of blocks filled with packets. 
- * in our memory space it's a regular mapped region; in kernel space
- * it is a number of discrete blocks. hence the description of the ring as 
- * blocks - see tpacket_req initialization in setup_rx
- *
  *
  */
 
 int setup_rx(void) {
   int rc=-1, ec;
 
-  /* sanity checks on allowable parameters. */
-  if (cfg.ring_block_sz % cfg.ring_frame_sz) {
-    fprintf(stderr,"-S block_sz must be multiple of -F frame_sz\n");
-    goto done;
-  }
-  unsigned page_sz = (unsigned)sysconf(_SC_PAGESIZE);
-  if (cfg.ring_block_sz % page_sz) {
-    fprintf(stderr,"-S block_sz must be multiple of page_sz %u\n", page_sz);
-    goto done;
-  }
-  if (cfg.ring_frame_sz <= TPACKET2_HDRLEN) {
-    fprintf(stderr,"-Z frame_sz must exceed %lu\n", TPACKET2_HDRLEN);
-    goto done;
-  }
-  if (cfg.ring_frame_sz % TPACKET_ALIGNMENT) {
-    fprintf(stderr,"-Z frame_sz must be a mulitple of %u\n", TPACKET_ALIGNMENT);
-    goto done;
-  }
-
-  cfg.ring_frame_nr = (cfg.ring_block_sz*cfg.ring_block_nr) / cfg.ring_frame_sz;
+  if (check_ring_parameters() < 0) goto done;
 
   /* any link layer protocol packets (linux/if_ether.h) */
   int protocol = htons(ETH_P_ALL);
@@ -274,13 +362,7 @@ int setup_rx(void) {
   cfg.req.tp_frame_size = cfg.ring_frame_sz; /* Size of frame/snaplen */
   cfg.req.tp_block_nr = cfg.ring_block_nr;   /* Number of blocks */
   cfg.req.tp_frame_nr = cfg.ring_frame_nr;   /* Total number of frames */
-  fprintf(stderr, "setting up PACKET_RX_RING:\n"
-                  " RING: (%u blocks * %u bytes per block) = %u bytes (%u MB)\n"
-                  " PACKETS: @(%u bytes/packet) = %u packets\n",
-                 cfg.ring_block_nr, cfg.ring_block_sz,
-                 cfg.ring_block_nr * cfg.ring_block_sz,
-                 cfg.ring_block_nr * cfg.ring_block_sz / (1024 * 1024),
-                 cfg.ring_frame_sz, cfg.ring_frame_nr);
+  describe_ring("PACKET_RX_RING");
   ec = setsockopt(cfg.fd, SOL_PACKET, PACKET_RX_RING, &cfg.req, sizeof(cfg.req));
   if (ec < 0) {
     fprintf(stderr,"setsockopt PACKET_RX_RING: %s\n", strerror(errno));
@@ -288,10 +370,10 @@ int setup_rx(void) {
   }
 
   /* now map the ring buffer we described above. lock in unswappable memory */
-  cfg.rb.n = cfg.req.tp_block_size * cfg.req.tp_block_nr;
-  cfg.rb.d = mmap(NULL, cfg.rb.n, PROT_READ|PROT_WRITE,
+  cfg.pb.n = cfg.req.tp_block_size * cfg.req.tp_block_nr;
+  cfg.pb.d = mmap(NULL, cfg.pb.n, PROT_READ|PROT_WRITE,
                       MAP_SHARED|MAP_LOCKED, cfg.fd, 0);
-  if (cfg.rb.d == MAP_FAILED) {
+  if (cfg.pb.d == MAP_FAILED) {
     fprintf(stderr,"mmap: %s\n", strerror(errno));
     goto done;
   }
@@ -325,57 +407,123 @@ int setup_rx(void) {
   return rc;
 }
 
+/* 
+ * create the transmit socket 
+ * 
+ * also see 
+ *
+ *    raw(7) 
+ *    packet(7).
+ *    packet_mmap.txt
+ *
+ * encapsulation mode uses a raw IP socket; 
+ * regular (NIC tx) mode uses a raw PACKET socket
+ *
+ */
 int setup_tx(void) {
-  int rc=-1, ec, one = 1;
+  int rc=-1, ec, one = 1, protocol;
 
-  /* create the transmit socket;  see raw(7) and packet(7).
-   * encap mode uses an IP "raw socket" (i.e. AF_INET, SOCK_RAW) [IP level]
-   * NIC tx mode uses a "packet socket" (i.e. AF_PACKET, SOCK_RAW) [link level]
-   */
-  int domain = cfg.encap.enable ? AF_INET : AF_PACKET;
-  int protocol = htons(ETH_P_ALL);
-  cfg.tx_fd = socket(domain, SOCK_RAW, protocol);
-  if (cfg.tx_fd == -1) {
-    fprintf(stderr,"socket: %s\n", strerror(errno));
-    goto done;
-  }
+  if (cfg.encap.enable) {
 
-  if (cfg.encap.enable) { /* tell raw socket that we'll form IP headers */
+    protocol = htons(ETH_P_ALL);
+
+    /* in encapsulation mode, use raw IP socket */
+    cfg.tx_fd = socket(AF_INET, SOCK_RAW, protocol);
+    if (cfg.tx_fd == -1) {
+      fprintf(stderr,"socket: %s\n", strerror(errno));
+      goto done;
+    }
+
+    /* tell raw IP socket that we'll form the IP headers */
     ec = setsockopt(cfg.tx_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     if (ec < 0) {
       fprintf(stderr,"setsockopt IP_HDRINCL: %s\n", strerror(errno));
       goto done;
     }
 
-  } else { /* standard tx mode. lookup interface, bind to it. */
-    struct ifreq ifr;
-    strncpy(ifr.ifr_name, cfg.dev, sizeof(ifr.ifr_name));
-    ec = ioctl(cfg.tx_fd, SIOCGIFINDEX, &ifr);
-    if (ec < 0) {
-      fprintf(stderr,"failed to find interface %s\n", cfg.dev);
-      goto done;
-    }
-    cfg.dev_ifindex = ifr.ifr_ifindex;
+    rc = 0;
+    goto done;
+  } 
+  
+  /* 
+   * standard tx mode
+   */
 
-    /* bind interface. doing this to imitate tcpreplay(1) */
-    /* using PACKET_HOST like tcpreplay; packet(7) says not needed */
-    /* setsockopt SO_BROADCAST like tcpreplay. again, necessary? */
-    struct sockaddr_ll sl;
-    memset(&sl, 0, sizeof(sl));
-    sl.sll_family = AF_PACKET;
-    sl.sll_protocol = protocol;
-    sl.sll_hatype = PACKET_HOST;
-    sl.sll_ifindex = cfg.dev_ifindex;
-    ec = bind(cfg.tx_fd, (struct sockaddr*)&sl, sizeof(sl));
-    if (ec < 0) {
-      fprintf(stderr,"socket: %s\n", strerror(errno));
-      goto done;
-    }
-    ec = setsockopt(cfg.tx_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
-    if (ec < 0) {
-      fprintf(stderr,"setsockopt SO_BROADCAST: %s\n", strerror(errno));
-      goto done;
-    }
+  /* use a raw PACKET (link-level) socket */
+  cfg.tx_fd = socket(AF_PACKET, SOCK_RAW, 0 /* tx only */);
+  if (cfg.tx_fd == -1) {
+    fprintf(stderr,"socket: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* convert interface name to index (in ifr.ifr_ifindex) */
+  struct ifreq ifr;
+  strncpy(ifr.ifr_name, cfg.dev, sizeof(ifr.ifr_name));
+  ec = ioctl(cfg.tx_fd, SIOCGIFINDEX, &ifr);
+  if (ec < 0) {
+    fprintf(stderr,"failed to find interface %s\n", cfg.dev);
+    goto done;
+  }
+
+  /* bind interface for tx */
+  struct sockaddr_ll sl;
+  memset(&sl, 0, sizeof(sl));
+  sl.sll_family = AF_PACKET;
+  sl.sll_ifindex = ifr.ifr_ifindex;
+  ec = bind(cfg.tx_fd, (struct sockaddr*)&sl, sizeof(sl));
+  if (ec < 0) {
+    fprintf(stderr,"socket: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* if we are using standard, sendto-based transmit, we are done */
+  if (cfg.use_tx_ring == 0) {
+    rc  = 0;
+    goto done;
+  }
+
+  /*************************************************************
+   * packet tx ring setup
+   ************************************************************/
+
+  if (check_ring_parameters() < 0) goto done;
+
+  int v = TPACKET_V2;
+  ec = setsockopt(cfg.tx_fd, SOL_PACKET, PACKET_VERSION, &v, sizeof(v));
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_VERSION: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* by default we handle a tx error, due to a malformed packet, fatally. 
+   * we can instead ask the kernel to simply ignore them.  see packet(7) */
+  ec = cfg.keep_going_on_tx_err ?
+      setsockopt(cfg.tx_fd, SOL_PACKET, PACKET_LOSS, &one, sizeof(one)) : 0;
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_LOSS: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* fill out the struct tpacket_req describing the ring buffer */
+  memset(&cfg.req, 0, sizeof(cfg.req));
+  cfg.req.tp_block_size = cfg.ring_block_sz; /* Min sz of contig block */
+  cfg.req.tp_frame_size = cfg.ring_frame_sz; /* Size of frame/snaplen */
+  cfg.req.tp_block_nr = cfg.ring_block_nr;   /* Number of blocks */
+  cfg.req.tp_frame_nr = cfg.ring_frame_nr;   /* Total number of frames */
+  describe_ring("PACKET_TX_RING");
+  ec = setsockopt(cfg.tx_fd, SOL_PACKET, PACKET_TX_RING, &cfg.req, sizeof(cfg.req));
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_TX_RING: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* map the tx ring buffer into unswappable memory */
+  cfg.pb.n = cfg.req.tp_block_size * cfg.req.tp_block_nr;
+  cfg.pb.d = mmap(NULL, cfg.pb.n, PROT_READ|PROT_WRITE,
+                      MAP_SHARED|MAP_LOCKED, cfg.tx_fd, 0);
+  if (cfg.pb.d == MAP_FAILED) {
+    fprintf(stderr,"mmap: %s\n", strerror(errno));
+    goto done;
   }
 
   rc = 0;
@@ -472,6 +620,8 @@ int periodic_work(void) {
       /* FALL THROUGH */
     case mode_funnel:
       if (bb_flush(cfg.ring, &cfg.bb) < 0) goto done;
+      break;
+    default:
       break;
   }
 
@@ -696,15 +846,64 @@ int keep_packet(char *tx, size_t nx) {
   return 1;
 }
 
+/* tx-ring mode only: start transmission from the ring */
+int initiate_transmit(void) {
+
+  assert(cfg.use_tx_ring);
+
+  /* initiate transmit, without waiting for completion */
+  if (send(cfg.tx_fd, NULL, 0, MSG_DONTWAIT) < 0) {
+
+    /* if tx is underway or the kernel can't sink any more data we can get
+     * "resource temporarily unavailable". solution: start a blocking tx */
+    if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+
+      if (send(cfg.tx_fd, NULL, 0, 0) < 0) {
+        fprintf(stderr,"blocking transmit failed: %s\n", strerror(errno));
+        return -1;
+      }
+
+    } else {
+
+      /* any other kind of send error is fatal */
+      fprintf(stderr,"failed to initiate transmit: %s\n", strerror(errno));
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+/* tx-ring mode only: poll kernel for space availability in tx ring */
+int wait_for_tx_space(void) {
+  int rc, timeout = 1000; /* milliseconds */
+
+  assert(cfg.use_tx_ring);
+
+  struct pollfd pfd;
+  pfd.fd = cfg.tx_fd;
+  pfd.revents = 0;
+  pfd.events = POLLOUT;
+
+  rc = poll(&pfd, 1, timeout);
+  if (rc <= 0) {
+    fprintf(stderr, "poll for tx space: %s\n", rc ? strerror(errno) : "timeout");
+    return -1;
+  }
+
+  return 0;
+}
+
 int transmit_packet(void) {
-  int rc=-1, n, nio;
+  int rc=-1, n, nio, len, nq=0, failsafe=0;
+  struct sockaddr_in sin;
+  struct sockaddr *dst = NULL;
   ssize_t nr,nt,nx;
   struct iovec *io;
-  struct sockaddr *dst = NULL;
   socklen_t sz = 0;
-  struct sockaddr_in sin;
+  uint8_t *mac;
 
-  /* get pointers and lengths for the iov vector */
+  /* get pointer to iov array to be populated */
   utvector_clear(cfg.rb.iov);
   nio = cfg.rb.iov->n;
   io = (struct iovec*)cfg.rb.iov->d;
@@ -716,8 +915,7 @@ int transmit_packet(void) {
     goto done;
   }
 
-  /* record in vector number of used iov slots */
-  if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
+  /* set number of used iov slots */
   assert(nio <= cfg.rb.iov->n);
   cfg.rb.iov->i = nio;
 
@@ -757,15 +955,121 @@ int transmit_packet(void) {
       sz = sizeof(sin);
     }
 
-    nt = sendto(cfg.tx_fd, tx, nx, 0, dst, sz);
-    if (nt != nx) {
-      fprintf(stderr,"sendto: %s\n", (nt < 0) ? strerror(errno) : "partial");
+    /* transmit the packet (standard tx mode) */
+    if (cfg.encap.enable || (cfg.use_tx_ring == 0)) {
+
+      nt = sendto(cfg.tx_fd, tx, nx, 0, dst, sz);
+      if (nt != nx) {
+        fprintf(stderr,"sendto: %s\n", (nt<0) ? strerror(errno) : "incomplete");
+        goto done;
+      }
+
+      /* resume while loop with next packet */
+      continue;
+    }
+
+    /*************************************************************
+     * packet tx ring mode below
+     ************************************************************/
+
+    assert(cfg.encap.enable == 0);
+    assert(cfg.use_tx_ring);
+
+    /* copy packet into kernel tx ring 
+     *
+     * each packet occupies a slot. a tpacket2_hdr precedes the packet.
+     * once we initiate transmission from the ring, the tx progresses
+     * in kernel space. later, when we come round to the slot again,
+     * we can check its transmission status or outcome.
+     *
+     * a tx error, due to a malformed packet, causes the kernel to stop
+     * transmitting from the ring. it sets TP_STATUS_WRONG_FORMAT on the
+     * packet. normally, we treat this condition fatally. if the "keep 
+     * going" option is enabled, tx errors are suppressed and ignored.
+
+     * when we are about to write a packet into the slot, we may find
+     * the slot is in this tx error state due to the previous packet.
+     * or, we may find that the slot is still in-use. due to our
+     * independence from the actual tranmission process, we only learn
+     * of these states when we come round to the slot. it is normal to
+     * encounter uninitiated or in-progress transmission, and we wait
+     * for availability in the ring in that case.
+     *
+     * for all its sophistication, the ring-based transmitter had
+     * lower performance in my tests than the sendto-based transmitter.
+     * this may be due to the extra copying we do to populate the ring.
+     * this is why the sendto-transmitter is used by default.
+     *
+     */
+
+    /* get address of the current slot (metadata header, pad, packet) */
+    uint8_t *cur = cfg.pb.d + cfg.ring_curr_idx * cfg.ring_frame_sz;
+
+    /* struct tpacket2_hdr is defined in /usr/include/linux/if_packet.h */
+    struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)cur;
+
+   retry_slot:
+
+    if (failsafe++ > 1) {
+      fprintf(stderr, "internal error awaiting tx ring availability\n");
       goto done;
     }
 
-    if (cfg.verbose) fprintf(stderr,"tx %ld byte packet\n", (long)nx);
+    /* did the slot have a previous error? */
+    if (hdr->tp_status == TP_STATUS_WRONG_FORMAT) {
+      fprintf(stderr,"tx error- frame dump follows; exiting.\n");
+      hexdump(cur, cfg.ring_frame_sz);
+      goto done;
+    }
 
+    /* is the slot in-use, in the midst of transmission? */
+    if (hdr->tp_status == TP_STATUS_SENDING) {
+      if (wait_for_tx_space() < 0) goto done;
+      goto retry_slot;
+    }
+
+    /* is the slot in-use, awaiting transmit to begin? this can happen if
+     * we loop around the ring, before initiating transmit (say, if the batch
+     * size exceeds the ring size). it can also happen if we did initiate tx,
+     * if the kernel has yet to get to this packet and flag it sending.
+     */
+    if (hdr->tp_status == TP_STATUS_SEND_REQUEST) {
+      if (initiate_transmit() < 0) goto done;
+      if (wait_for_tx_space() < 0) goto done;
+      goto retry_slot;
+    }
+
+    /* if we got here, the slot _must_ be available. right? */
+    if (hdr->tp_status != TP_STATUS_AVAILABLE) {
+      fprintf(stderr,"tx slot: unexpected flag %d\n", hdr->tp_status);
+      goto done;
+    }
+
+    failsafe = 0;  /* reset loop safegaurd */
+
+    /* put packet's link level header (first MAC) after the tpacket2_hdr plus
+     * alignment gap.  (struct sockaddr_ll is not in the slot during tx). */
+    mac = (uint8_t*)TPACKET_ALIGN(((unsigned long)cur) +
+          sizeof(struct tpacket2_hdr));
+    len = cfg.ring_frame_sz - (mac - cur);
+    if (nx > len) {
+      fprintf(stderr, "packet length %ld exceeds effective frame_size %d\n",
+        (long)nx, len);
+      goto done;
+    }
+
+    /* populate packet proper */
+    memcpy(mac, tx, nx);
+    hdr->tp_len = nx;
+    hdr->tp_status = TP_STATUS_SEND_REQUEST;
+    nq++;
+
+    /* point to next slot */
+    cfg.ring_curr_idx = (cfg.ring_curr_idx + 1) % cfg.ring_frame_nr;
   }
+
+  /* if packets were queued in to kernel tx ring, initiate transmit */
+  if (nq && (initiate_transmit() < 0)) goto done;
 
   rc = 0;
 
@@ -773,8 +1077,6 @@ int transmit_packet(void) {
   return rc;
 }
 
-/* right now sampling is the only way we elect to drop a packet */
-/* plow through the ready packets in the packet ring shared with kernel */
 int receive_packets(void) {
   int rc=-1, sw, wire_vlan, form_vlan;
   ssize_t nr,nt,nx;
@@ -784,7 +1086,7 @@ int receive_packets(void) {
   while (1) {
 
     /* get address of the current slot (metadata header, pad, packet) */
-    uint8_t *cur = cfg.rb.d + cfg.ring_curr_idx * cfg.ring_frame_sz;
+    uint8_t *cur = cfg.pb.d + cfg.ring_curr_idx * cfg.ring_frame_sz;
 
     /* struct tpacket2_hdr is defined in /usr/include/linux/if_packet.h */
     struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)cur;
@@ -995,7 +1297,7 @@ int main(int argc, char *argv[]) {
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KR")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
@@ -1014,6 +1316,8 @@ int main(int argc, char *argv[]) {
       case 'Z': cfg.ring_frame_sz=atoi(optarg); break;
       case 'Q': cfg.strip_vlan = 1; break;
       case 'd': cfg.drop_pct=100-atoi(optarg); break;
+      case 'K': cfg.keep_going_on_tx_err = 1; break;
+      case 'R': cfg.use_tx_ring = 1; break;
       case 'h': default: usage(); break;
     }
   }
@@ -1146,6 +1450,10 @@ done:
   if (cfg.epoll_fd != -1) close(cfg.epoll_fd);
   utmm_fini(&bb_mm, &cfg.bb, 1);
   utmm_fini(&bb_mm, &cfg.rb, 1);
+  if ((cfg.pb.n != 0) && (cfg.pb.d != MAP_FAILED)) {
+    munmap(cfg.pb.d, cfg.pb.n); /* cfg.pb is mode specfic */
+    assert(cfg.pb.iov == NULL); /* iov part of pb unused */
+  }
   if (cfg.ring) shr_close(cfg.ring);
   p = NULL; while ( (p = utvector_next(cfg.aux_rings, p)) != NULL) shr_close(*p);
   utvector_free(cfg.aux_rings);
