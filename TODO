@@ -1,8 +1,0 @@
- TODO
-
-- query outgoing MTU and detect attempt to exceed
-- use ethool ioctl's to disable offload 
-- track ingest packet drop (pre ring)
-- AF_PACKET+PACKET_RX_RING 
-- timestamping
-- 10g testing

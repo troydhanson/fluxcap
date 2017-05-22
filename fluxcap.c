@@ -83,6 +83,7 @@ struct {
   int drop_pct;   /* sampling % 0 (keep all)-100(drop all) */
   int use_tx_ring; /* 0 = sendto-based tx; 1=packet mmap ring-based tx */
   int keep_going_on_tx_err;  /* ignore tx errors from malformed packets */
+  int bypass_qdisc_on_tx; /* bypass kernel qdisc layer, more risk of loss */
 } cfg = {
   .bb.n = BATCH_SIZE,
   .rb.n = BATCH_SIZE,
@@ -156,14 +157,15 @@ void usage() {
        "\n"
        "encapsulation modes (tx-only):\n"
        "\n"
+       "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation; preferred)\n"
        "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
-       "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation)\n"
        "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation)\n"
        "\n"
        "other options:\n"
        "\n"
        "    -V <vlan>    (inject VLAN tag) [rx/tee/tx]\n"
        "    -Q           (strip VLAN tag) [rx]\n"
+       "    -q           (bypass qdisc buffering layer) [tx]\n"
        "    -s <size>    (snaplen- truncate at this size)\n"
        "    -D <n>       (trim n tail bytes)\n"
        "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx/tx]\n"
@@ -473,6 +475,19 @@ int setup_tx(void) {
   ec = bind(cfg.tx_fd, (struct sockaddr*)&sl, sizeof(sl));
   if (ec < 0) {
     fprintf(stderr,"socket: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* when qdisc bypass is enabled, to quote packet_mmap.txt, "packets sent
+   * through PF_PACKET will bypass the kernel's qdisc layer and are ...
+   * pushed to the driver directly.  Meaning, packet are not buffered, tc
+   * disciplines are ignored, increased loss can occur and such packets are 
+   * not visible to other PF_PACKET sockets anymore."
+   */
+  ec = cfg.bypass_qdisc_on_tx ?
+      setsockopt(cfg.tx_fd, SOL_PACKET, PACKET_QDISC_BYPASS, &one, sizeof(one)) : 0;
+  if (ec < 0) {
+    fprintf(stderr,"setsockopt PACKET_QDISC_BYPASS: %s\n", strerror(errno));
     goto done;
   }
 
@@ -894,7 +909,7 @@ int wait_for_tx_space(void) {
   return 0;
 }
 
-int transmit_packet(void) {
+int transmit_packets(void) {
   int rc=-1, n, nio, len, nq=0, failsafe=0;
   struct sockaddr_in sin;
   struct sockaddr *dst = NULL;
@@ -1088,8 +1103,9 @@ int receive_packets(void) {
     /* get address of the current slot (metadata header, pad, packet) */
     uint8_t *cur = cfg.pb.d + cfg.ring_curr_idx * cfg.ring_frame_sz;
 
-    /* struct tpacket2_hdr is defined in /usr/include/linux/if_packet.h */
+    /* these structs start the frame, see /usr/include/linux/if_packet.h */
     struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)cur;
+    struct sockaddr_ll *sll = (struct sockaddr_ll *)(cur + TPACKET2_HDRLEN);
 
     /* check if the packet is ready. this is how we break the loop */
     if ((hdr->tp_status & TP_STATUS_USER) == 0) break;
@@ -1113,7 +1129,7 @@ int receive_packets(void) {
       goto done;
     }
 
-    /* truncate outgoing packet if requested */
+    /* truncate packet if requested */
     if (cfg.size && (nx > cfg.size)) nx = cfg.size;
 
     /* trim N bytes from frame end if requested. */
@@ -1203,7 +1219,7 @@ int handle_io(void) {
       rc = receive_packets();
       break;
     case mode_transmit:
-      rc = transmit_packet();
+      rc = transmit_packets();
       break;
     case mode_tee:
       rc = tee_packet();
@@ -1297,7 +1313,7 @@ int main(int argc, char *argv[]) {
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KR")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KRq")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
@@ -1314,6 +1330,7 @@ int main(int argc, char *argv[]) {
       case 'B': cfg.ring_block_nr=atoi(optarg); break;
       case 'S': cfg.ring_block_sz = 1 << (unsigned)atoi(optarg); break;
       case 'Z': cfg.ring_frame_sz=atoi(optarg); break;
+      case 'q': cfg.bypass_qdisc_on_tx = 1; break;
       case 'Q': cfg.strip_vlan = 1; break;
       case 'd': cfg.drop_pct=100-atoi(optarg); break;
       case 'K': cfg.keep_going_on_tx_err = 1; break;

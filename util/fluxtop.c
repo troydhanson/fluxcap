@@ -32,6 +32,7 @@ struct {
   int verbose;
   char *prog;
   enum {mode_monitor, mode_notty} mode;
+  enum {unit_bit, unit_pkt} unit; /* throughput in bits/s or pkts/s */
   char *file;
   int ticks;
   int signal_fd;
@@ -98,9 +99,10 @@ unsigned long subtract_timeval(struct timeval *b, struct timeval *a) {
 
 /* returns volatile memory - use immediately or copy.
  * takes bits-per-second as input, returns like "20 Mbit/s"
+ * where "bit" is the unit, can also be "pkt" etc.
  * using whatever SI unit is most readable (K,M,G,T) 
  */
-char *format_rate(unsigned long bps) {
+char *format_rate(unsigned long bps, char *unit) {
   double b = bps;
   char c = ' ';
   if (b > 1024) { b /= 1024; c = 'K'; }
@@ -108,27 +110,33 @@ char *format_rate(unsigned long bps) {
   if (b > 1024) { b /= 1024; c = 'G'; }
   if (b > 1024) { b /= 1024; c = 'T'; }
   utstring_clear(cfg.tmp);
-  utstring_printf(cfg.tmp, "%10.2f %cbit/s", b, c);
+  utstring_printf(cfg.tmp, "%10.2f %c%s/s", b, c, unit);
   return utstring_body(cfg.tmp);
 }
 
-int update_rates() {
+int update_rates(int use_sample) {
   struct shr **r;
   struct shr_stat stat,sum,*sa,*ss;
   struct timeval ts;
   int rc = -1, sc, i, j;
   UT_string *n;
   char *s;
-  unsigned long age;
+  unsigned long usec;
   double bps_r, bps_w, bps_l;
+  double mps_r, mps_w, mps_l;
   struct timeval oldest;
   ring_trend *t;
 
   utstring_clear(cfg.rates);
 
   tpl_node *tn = NULL;
-  tn = tpl_map("A(sfffUUUUUUUUU)", &s, &bps_r, &bps_w, &bps_l, 
-        &stat.bw, &stat.br, &stat.mw, &stat.mr, &stat.md, &stat.bd, &stat.bn,
+  tn = tpl_map("A(sffffffUUUUUUUUU)", &s, 
+        &bps_r, &bps_w, &bps_l, 
+        &mps_r, &mps_w, &mps_l, 
+        &stat.bw, &stat.br, 
+        &stat.mw, &stat.mr, 
+        &stat.md, &stat.bd, 
+        &stat.bn,
         &stat.bu, &stat.mu);
   if (tn == NULL) goto done;
 
@@ -141,6 +149,8 @@ int update_rates() {
     sa = *t;
     sc = shr_stat(*r, &stat, &cfg.now);
     if ( sc < 0) { fprintf(stderr, "shr_stat: error\n"); goto done; }
+
+    if (use_sample == 0) continue; 
 
     sa[cfg.stat_bkt] = stat; /* struct copy */
 
@@ -170,12 +180,16 @@ int update_rates() {
         sum.bd += ss->bd;
     }
     
-    age = subtract_timeval(&cfg.now, &oldest);
+    usec = subtract_timeval(&cfg.now, &oldest);
 
     /* calculate bit-per-second read and written, omitting frame headers */
-    bps_r = (sum.br - sum.mr * sizeof(size_t)) * 8.0 * MILLION / age;
-    bps_w = (sum.bw - sum.mw * sizeof(size_t)) * 8.0 * MILLION / age;
-    bps_l = (sum.bd - sum.md * sizeof(size_t)) * 8.0 * MILLION / age;
+    bps_r = (sum.br - sum.mr * sizeof(size_t)) * 8.0 * MILLION / usec;
+    bps_w = (sum.bw - sum.mw * sizeof(size_t)) * 8.0 * MILLION / usec;
+    bps_l = (sum.bd - sum.md * sizeof(size_t)) * 8.0 * MILLION / usec;
+    /* calculate pkt-per-second read and written */
+    mps_r = sum.mr * MILLION * 1.0 / usec;
+    mps_w = sum.mw * MILLION * 1.0 / usec;
+    mps_l = sum.md * MILLION * 1.0 / usec;
     s = utstring_body(n);
     tpl_pack(tn, 1);
 
@@ -208,17 +222,22 @@ int dump_rates_curses() {
   struct shr_stat stat;
   char *s;
   double bps_r, bps_w, bps_l;
+  double mps_r, mps_w, mps_l;
 
   clear();
 
   if (cfg.rates->i == 0) goto done; // no data ready
 
-  tn = tpl_map("A(sfffUUUUUUUUU)", &s, &bps_r, &bps_w, &bps_l, 
-        &stat.bw, &stat.br, &stat.mw, &stat.mr, &stat.md, &stat.bd, &stat.bn,
+  tn = tpl_map("A(sffffffUUUUUUUUU)", &s, 
+        &bps_r, &bps_w, &bps_l, 
+        &mps_r, &mps_w, &mps_l, 
+        &stat.bw, &stat.br, 
+        &stat.mw, &stat.mr, 
+        &stat.md, &stat.bd, 
+        &stat.bn,
         &stat.bu, &stat.mu);
   if (tn == NULL) goto done;
   if (tpl_load(tn, TPL_MEM, cfg.rates->d, cfg.rates->i) < 0) goto done;
-
 
   attron(A_BOLD);
   move(0, 0); printw("ring");
@@ -232,9 +251,18 @@ int dump_rates_curses() {
   y = 2;
   while (tpl_unpack(tn,1) > 0) {
     move(y, 0); printw(s);
-    move(y,20); printw( format_rate(bps_w) );
-    move(y,40); printw( format_rate(bps_r) );
-    move(y,60); if (stat.bd) printw( format_rate(bps_l) );
+    if (cfg.unit == unit_bit) {
+      move(y,20); printw( format_rate(bps_w,"bit") );
+      move(y,40); printw( format_rate(bps_r,"bit") );
+      move(y,60); if (stat.bd) printw( format_rate(bps_l,"bit") );
+    } else if (cfg.unit == unit_pkt) {
+      move(y,20); printw( format_rate(mps_w,"pkt") );
+      move(y,40); printw( format_rate(mps_r,"pkt") );
+      move(y,60); if (stat.bd) printw( format_rate(mps_l,"pkt") );
+    } else {
+      assert(0);
+      goto done;
+    }
     y++;
     
     /*
@@ -245,6 +273,12 @@ int dump_rates_curses() {
     
     free(s);
   }
+
+  y++;
+  attron(A_BOLD);
+  move(y,30);
+  printw("  q: quit, space: toggle units");
+  attroff(A_BOLD);
   refresh();
 
   rc = 0;
@@ -288,7 +322,7 @@ int update() {
   int rc = -1;
 
   gettimeofday(&cfg.now, NULL);
-  if (update_rates() < 0) goto done;
+  if (update_rates(1) < 0) goto done;
 
   switch(cfg.mode) {
     case mode_notty:
@@ -327,6 +361,22 @@ int handle_signal(void) {
   }
 
  rc = 0;
+
+ done:
+  return rc;
+}
+
+int handle_keypress(void) {
+  int rc= -1, bc;
+  char c;
+
+  bc = read(STDIN_FILENO, &c, sizeof(c));
+  if (bc <= 0) goto done;
+  if (c == 'q') goto done; /* quit program */
+  if (c == ' ') {          /* toggle bit/s or msgs/s */
+    cfg.unit = (cfg.unit == unit_pkt) ? unit_bit : unit_pkt;
+  }
+  rc = 0;
 
  done:
   return rc;
@@ -411,7 +461,7 @@ int main(int argc, char *argv[]) {
   }
 
   /* call once before initializing curses so errors are visible */
-  if (update_rates() < 0) goto done;
+  if (update_rates(0) < 0) goto done;
 
   if (cfg.mode == mode_monitor) {
     initscr();
@@ -431,7 +481,7 @@ int main(int argc, char *argv[]) {
     if      (ec < 0)  fprintf(stderr, "epoll: %s\n", strerror(errno));
     else if (ec == 0) update();
     else if (ev.data.fd == cfg.signal_fd) { if (handle_signal()  < 0) goto done; }
-    else if (ev.data.fd == STDIN_FILENO) break; /* exit on keypress */
+    else if (ev.data.fd == STDIN_FILENO)  { if (handle_keypress()  < 0) goto done; }
   } while (ec >= 0);
 
   rc = 0;
