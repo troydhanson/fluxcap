@@ -484,12 +484,19 @@ int setup_tx(void) {
    * disciplines are ignored, increased loss can occur and such packets are 
    * not visible to other PF_PACKET sockets anymore."
    */
+#ifdef PACKET_QDISC_BYPASS
   ec = cfg.bypass_qdisc_on_tx ?
       setsockopt(cfg.tx_fd, SOL_PACKET, PACKET_QDISC_BYPASS, &one, sizeof(one)) : 0;
   if (ec < 0) {
     fprintf(stderr,"setsockopt PACKET_QDISC_BYPASS: %s\n", strerror(errno));
     goto done;
   }
+#else
+  if (cfg.bypass_qdisc_on_tx) {
+    fprintf(stderr,"setsockopt PACKET_QDISC_BYPASS: unsupported\n");
+    goto done;
+  }
+#endif
 
   /* if we are using standard, sendto-based transmit, we are done */
   if (cfg.use_tx_ring == 0) {
