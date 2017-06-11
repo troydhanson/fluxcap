@@ -423,6 +423,7 @@ int main(int argc, char *argv[]) {
     cfg.mode = mode_notty;
   }
 
+  /* block all signals. we take signals synchronously via signalfd */
   sigset_t all;
   sigfillset(&all);
   sigprocmask(SIG_SETMASK,&all,NULL);
@@ -473,7 +474,6 @@ int main(int argc, char *argv[]) {
     if (new_epoll(EPOLLIN, STDIN_FILENO)) goto done; /* keypress */
   }
 
-  /* block all signals. we take signals synchronously via signalfd */
   alarm(1);
 
   do { 

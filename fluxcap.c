@@ -155,11 +155,14 @@ void usage() {
        "\n"
        "  <size> may have k/m/g/t suffix\n"
        "\n"
-       "encapsulation modes (tx-only):\n"
+       "GRE encapsulation modes (tx-only):\n"
        "\n"
        "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation; preferred)\n"
        "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
-       "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation)\n"
+       "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation; untested!)\n"
+       "\n"
+       "  Use snaplen with a GRE tunnel, e.g., '-s 1476' to avoid tx errors,\n"
+       "  as GRE tunnel MTU is 24 bytes less than physical interface IP MTU.\n"
        "\n"
        "other options:\n"
        "\n"
@@ -412,31 +415,38 @@ int setup_rx(void) {
 /* 
  * create the transmit socket 
  * 
- * also see 
+ * There are two fundamentally different types of sockets here, only one
+ * of which is created, based on whether we are doing *encapsulated* transmit
+ * (of the packet into a GRE tunnel that then rides over regular IP); or
+ * "regular" packet transmission where we inject the packet to the NIC.
  *
- *    raw(7) 
- *    packet(7).
- *    packet_mmap.txt
+ *     MODE            SOCKET TYPE         SEE ALSO
+ *     --------         ----------------    ---------------
+ *     ENCAPSULATE     RAW IP              ip(7) and raw(7)
+ *     REGULAR         RAW PACKET          packet(7) 
  *
- * encapsulation mode uses a raw IP socket; 
- * regular (NIC tx) mode uses a raw PACKET socket
+ * Within REGULAR mode we further distinguish between sendto()-based
+ * transmit, versus packet tx ring mode. The latter uses the kernel ring
+ * buffer mechanism described in packet_mmap.txt.
  *
  */
 int setup_tx(void) {
-  int rc=-1, ec, one = 1, protocol;
+  int rc=-1, ec, one = 1;
 
   if (cfg.encap.enable) {
 
-    protocol = htons(ETH_P_ALL);
+    if (cfg.size == 0) {
+      fprintf(stderr, "warning: -s <snaplen> advised with GRE encapsulation\n");
+    }
 
-    /* in encapsulation mode, use raw IP socket */
-    cfg.tx_fd = socket(AF_INET, SOCK_RAW, protocol);
+    /* in encapsulation mode, use raw IP socket. IPPROTO GRE == 47 */
+    cfg.tx_fd = socket(AF_INET, SOCK_RAW, 47);
     if (cfg.tx_fd == -1) {
       fprintf(stderr,"socket: %s\n", strerror(errno));
       goto done;
     }
 
-    /* tell raw IP socket that we'll form the IP headers */
+    /* IP_HDRINCL means WE form the IP headers.. with some help; see raw(7) */
     ec = setsockopt(cfg.tx_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     if (ec < 0) {
       fprintf(stderr,"setsockopt IP_HDRINCL: %s\n", strerror(errno));
