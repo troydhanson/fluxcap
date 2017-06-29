@@ -1,6 +1,7 @@
 fluxtop
 fluxcap
 ramdisk
+watch_copy
 *.o
 *.swp
 Makefile.in

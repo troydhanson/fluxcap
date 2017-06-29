@@ -108,7 +108,8 @@ IP fragments and present a large, single, reassembled IP datagram to the host.
 While this datagram is a valid reconstruction, it cannot be retransmitted 
 because it exceeds the MTU on the network. A regular TCP/IP socket would 
 perform fragmentation automatically but raw sockets do not). Disabling
-offloading solves these problems.
+offloading solves these problems. An explanation of some offload parameters
+can be found [here](https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Linux/6/html/Performance_Tuning_Guide/network-nic-offloads.html).
 
 Optionally, iptables(8) can be set up to drop all input and output packets on
 the interfaces that fluxcap is receiving and transmitting on. This prevents the
@@ -223,29 +224,23 @@ manager.  I use [pmtr](http://troydhanson.github.io/pmtr/) for this purpose.
 
 Fluxcap can transmit packets over a routed/switched network too. This requires
 use of one the encapsulation modes. The supported encapsulation modes are GRE,
-GRETAP and ERSPAN.
+GRETAP and ERSPAN.  The GRETAP ("transparent ethernet bridging") encapsulation
+preserves original MAC addresses in the encapsulation, and is preferred.
 
+    fluxcap -tx -E gretap:192.168.102.100 tap  # GRETAP encapsulation (preferred)
     fluxcap -tx -E gre:192.168.102.100 tap     # GRE encapsulation
-    fluxcap -tx -E gretap:192.168.102.100 tap  # GRETAP encapsulation
-    fluxcap -tx -E erspan:192.168.102.100 tap  # ERSPAN encapsulation
+    fluxcap -tx -E erspan:192.168.102.100 tap  # ERSPAN encapsulation (untested)
 
 On the remote (recipient) end, you can confirm the data is being received using:
 
     tcpdump -i eth0 -nne proto gre
 
-You can take this a step further, and have a Linux recipient decapsulate the
-GRE or GRETAP encapsulation. This results in Linux presenting a virtual NIC
-with the decapsulated packets.
+This works for any of the encapsulations, since all three modes utilize GRE tunnels.
 
-    # GRE decapsulation
-    modprobe ip_gre
-    ip tunnel add gre1 mode gre remote 192.168.102.1 local 192.168.102.100 ttl 255
-    ip link set gre1 up
-    tcpdump -i gre1 -nne
+##### Decapsulation 
 
- If the fluxcap transmitter uses gretap ("transparent ethernet bridging") 
- encapsulation instead, which preserves MAC addresses in the encapsulation,
- it can be received this way instead:
+If the recipient host is Linux, you can have it decapsulate the data for you.
+This results in Linux presenting a virtual NIC with the decapsulated packets.
 
     # GRETAP decapsulation
     modprobe ip_gre
@@ -253,4 +248,16 @@ with the decapsulated packets.
     ip link set gretap1 up
     tcpdump -i gretap1 -nne
 
+You should replace 192.168.102.x with the actual local (recipient) and remote
+(transmitter) IP addresses. 
 
+Decapsulating plain GRE is similar.
+
+    # GRE decapsulation
+    modprobe ip_gre
+    ip tunnel add gre1 mode gre remote 192.168.102.1 local 192.168.102.100 ttl 255
+    ip link set gre1 up
+    tcpdump -i gre1 -nne
+
+You may need to ensure that iptables/firewalld allow the traffic. On a CentOS 7
+system, `sudo systemctl stop firewalld` permits the data to arrive on gretap1.
