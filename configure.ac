@@ -20,9 +20,28 @@ then
   ])
 fi
 
-AC_CHECK_LIB(ncurses,initscr,
-  AM_CONDITIONAL(HAVE_NCURSES,true),
-    AM_CONDITIONAL(HAVE_NCURSES,false))
+have_ncurses_header=n
+have_ncurses_lib=n
+AC_CHECK_HEADERS([ncurses.h],[have_ncurses_header=y])
+AC_CHECK_LIB(ncurses,initscr,[have_ncurses_lib=y])
+if test "x${have_ncurses_header}${have_ncurses_lib}" != xyy
+then
+  AM_CONDITIONAL(HAVE_NCURSES,false)
+else
+  AM_CONDITIONAL(HAVE_NCURSES,true)
+fi
+
+
+have_pcre_header=n
+have_pcre_lib=n
+AC_CHECK_HEADERS([pcre.h],[have_pcre_header=y])
+AC_CHECK_LIB(pcre,pcre_exec,[have_pcre_lib=y])
+if test "x${have_pcre_header}${have_pcre_lib}" != xyy
+then
+  AM_CONDITIONAL(HAVE_PCRE,false)
+else
+  AM_CONDITIONAL(HAVE_PCRE,true)
+fi
 
 AC_CONFIG_FILES([Makefile
    util/Makefile

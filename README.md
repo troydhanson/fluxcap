@@ -231,6 +231,9 @@ preserves original MAC addresses in the encapsulation, and is preferred.
     fluxcap -tx -E gre:192.168.102.100 tap     # GRE encapsulation
     fluxcap -tx -E erspan:192.168.102.100 tap  # ERSPAN encapsulation (untested)
 
+It is recommended to use `-s 1476` with a a gretap transmitter to truncate packets
+that would exceed the standard MTU when tunneled inside GRE.
+
 On the remote (recipient) end, you can confirm the data is being received using:
 
     tcpdump -i eth0 -nne proto gre

@@ -6,6 +6,13 @@ ramdisk_CPPFLAGS = -I$(srcdir)/../lib/libut/include
 
 watch_copy_SOURCES = watch_copy.c
 
+if HAVE_PCRE
+bin_PROGRAMS += ffcp
+ffcp_SOURCES = ffcp.c
+ffcp_CPPFLAGS = -I$(srcdir)/../lib/libut/include
+ffcp_LDADD = -L../lib -lut -lshr -lpcre
+endif
+
 if HAVE_NCURSES
 bin_PROGRAMS += fluxtop
 fluxtop_SOURCES = fluxtop.c
