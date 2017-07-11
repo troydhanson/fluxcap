@@ -1,12 +1,15 @@
-#include <sys/epoll.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/epoll.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/time.h>
-#include <sys/signalfd.h>
+#include <limits.h>
 #include <signal.h>
 #include <string.h>
-#include <time.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -14,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pcre.h>
+#include <time.h>
 #include "shr.h"
 
 #define OVECSZ 30 /* must be multiple of 3 */
@@ -36,35 +40,59 @@ struct iovec read_iov[BATCH_FRAMES];
 struct {
   char *prog;
   int verbose;
+  int dry_run;
   int epoll_fd;     /* epoll descriptor */
   int signal_fd;    /* to receive signals */
   int ring_fd;      /* ring readability fd */
   char *input_ring; /* ring file name */
+  char *output_ring;/* ring file name */
   struct shr *ring; /* open ring handle */
+  struct shr *oring;/* output ring handle */
   char *buf;        /* buf for shr_readv */
   struct iovec *iov;/* iov for shr_readv */
-  char *pattern;    /* regex applied to input filenames */
+  char *regex;    /* regex applied to input filenames */
   char *template;   /* basis of output filenames */
-  pcre *re;         /* compiled pattern */
+  pcre *re;         /* compiled regex */
+  char tmp[PATH_MAX];
+  char rpath1[PATH_MAX];
+  char rpath2[PATH_MAX];
+  char opath[PATH_MAX];
 } cfg = {
   .buf = read_buffer,
   .iov = read_iov,
   .epoll_fd = -1,
   .signal_fd = -1,
   .ring_fd = -1,
-  .pattern = "^.+$",   /* default regex matches any nonempty string */
-  .template = "$0",    /* default output template is copy of input */
+  .regex = "([^/]+)$", /* default: match any path, capture basename */
+  .template = "$1",       /* default: output filename is input basename */
 };
 
 /* signals that we'll accept via signalfd in epoll */
 int sigs[] = {SIGHUP,SIGTERM,SIGINT,SIGQUIT,SIGALRM};
 
 void usage() {
-  fprintf(stderr,"usage: %s [options] -i <filenames-ring>\n", cfg.prog);
+  fprintf(stderr,"fluxcap file copy utility\n\n");
+  fprintf(stderr,"This tool continuously copies files using a naming template.\n"
+                 "The original filenames arrive in the input ring. They are\n"
+                 "matched against the given regular expression. Matches are\n"
+                 "made into a new filename according to the given template.\n"
+                 "The template uses captures from the regular expression by\n"
+                 "referring to $0 (whole matching expression), $1 (first\n"
+                 "capture), etc. After $9 the captures are $A through $Z.\n\n");
+  fprintf(stderr,"usage: %s <options>\n\n", cfg.prog);
   fprintf(stderr,"options:\n"
-                 "   -v         (verbose)\n"
-                 "   -p <regex> (pattern)\n"
-                 "   -h         (this help)\n"
+                 "   -i <input-ring>    [required; input filenames in ring]\n"
+                 "   -p <regex>         [default: wildcard, capture basename]\n"
+                 "   -t <template>      [default: basename of original]\n"
+                 "   -o <output-ring>   [log output filenames to ring]\n"
+                 "   -d                 [dry-run; show names, no copying]\n"
+                 "   -h                 [this help]\n"
+                 "   -v                 [verbose; repeatable]\n"
+                 "\n"
+                 "Examples:\n"
+                 "\n"
+                 "ffcp -i in -v -o out -t '/tmp/out/$1'\n"
+                 "\n"
                  "\n");
   exit(-1);
 }
@@ -75,7 +103,6 @@ int add_epoll(int events, int fd) {
   memset(&ev,0,sizeof(ev)); // placate valgrind
   ev.events = events;
   ev.data.fd= fd;
-  if (cfg.verbose) fprintf(stderr,"adding fd %d to epoll\n", fd);
   rc = epoll_ctl(cfg.epoll_fd, EPOLL_CTL_ADD, fd, &ev);
   if (rc == -1) {
     fprintf(stderr,"epoll_ctl: %s\n", strerror(errno));
@@ -129,27 +156,199 @@ int handle_signal(void) {
   return rc;
 }
 
-/* the heart of this program is here. we process one filename */
-int process(char *file, size_t len) {
-  int ovec[OVECSZ], rc = -1, pe, l, i;
-  char *c;
+int map_copy(char *file, char *dest) {
+  struct stat s;
+  char *src=NULL,*dst=NULL;
+  int fd=-1,dd=-1,rc=-1;
 
-  if (cfg.verbose) fprintf(stderr, "input: %.*s\n", len, file);
-
-  pe = pcre_exec(cfg.re, NULL, file, len, 0, 0, ovec, OVECSZ);
-
-  if (pe < 0) {
-    if (pe == PCRE_ERROR_NOMATCH) {
-      fprintf(stderr, "skipping %.*s: not a match for regex\n", len, file);
-      rc = 0;
-      goto done;
-    }
-
-    fprintf(stderr, "pcre_exec: error (%d) - see pcreapi(3)\n", pe);
+  if (cfg.dry_run) {
+    rc = 0;
     goto done;
   }
 
+  /* source file */
+  if ( (fd = open(file, O_RDONLY)) == -1) {
+    fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
+    goto done;
+  }
+  if (fstat(fd, &s) == -1) {
+    fprintf(stderr,"can't stat %s: %s\n", file, strerror(errno));
+    goto done;
+  }
+  if (!S_ISREG(s.st_mode)) {
+    fprintf(stderr,"not a regular file: %s\n", file);
+    goto done;
+  }
+  /* dest file */
+  if ( (dd = open(dest, O_RDWR|O_TRUNC|O_CREAT, 0644)) == -1) {
+    fprintf(stderr,"can't open %s: %s\n", dest, strerror(errno));
+    goto done;
+  }
+  if (ftruncate(dd, s.st_size) == -1) {
+    fprintf(stderr,"ftruncate: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* copying a zero len file? we're done. don't attempt to map */
+  if (s.st_size == 0) {
+    rc = 0;
+    goto done;
+  }
+
+  /* map both */
+  src = mmap(0, s.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (src == MAP_FAILED) {
+    fprintf(stderr, "mmap %s: %s\n", file, strerror(errno));
+    goto done;
+  }
+
+  dst = mmap(0, s.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, dd, 0);
+  if (dst == MAP_FAILED) {
+    fprintf(stderr, "mmap %s: %s\n", dest, strerror(errno));
+    goto done;
+  }
+  memcpy(dst,src,s.st_size);
+
+  rc = 0;
+
+done:
+  if (src && (src != MAP_FAILED)) munmap(src, s.st_size);
+  if (dst && (dst != MAP_FAILED)) munmap(dst, s.st_size);
+  if (fd != -1) close(fd);
+  if (dd != -1) close(dd);
+  return rc;
+}
+
+/* user probably did not intend to copy "file" to "./file" so we
+ * error if src/dst pathnames resolve to the same file name.
+ *
+ * returns
+ *  0 if files differ
+ *  1 if files same
+ * -1 on error (not file)
+ *
+ */
+int same_file(char *path1, char *path2) {
+  int rc = -1;
+
+  if (realpath(path1, cfg.rpath1) == NULL) {
+    fprintf(stderr, "realpath: %s: %s\n", path1, strerror(errno));
+    goto done;
+  }
+
+  if (realpath(path2, cfg.rpath2) == NULL) {
+    fprintf(stderr, "realpath: %s: %s\n", path2, strerror(errno));
+    goto done;
+  }
+
+  rc = strcmp(cfg.rpath1, cfg.rpath2) ? 0 : 1;
+  if (rc == 1) {
+    fprintf(stderr, "%s and %s are the same file\n", path1, path2);
+    goto done;
+  }
+
+ done:
+  return rc;
+}
+
+
+#define append(c) do {               \
+  if (olen == 0) {                   \
+    fprintf(stderr,"buffer full\n"); \
+    goto done;                       \
+  }                                  \
+  *o = c;                            \
+  olen--;                            \
+  o++;                               \
+} while(0)
+
+/* make a pathname from template applied to src. */
+int pat2path(char *file, int *ovec, int pe) {
+  char *p, *o, *c, opath[PATH_MAX];
+  int i, rc = -1, ec; 
+  unsigned char x;
+  size_t olen, l;
+
+  /* show captures for debugging */
+  if (cfg.verbose > 1) {
+    for(i=0; i < pe*2; i+=2) {
+      c = &file[ovec[i]];
+      l = ovec[i+1]-ovec[i];
+      fprintf(stderr, " $%u matched %.*s\n", i/2, l, c);
+    }
+  }
+
+  p = cfg.template;
+  o = cfg.opath;
+  olen = sizeof(cfg.opath);
+
+  while (*p != '\0') {
+    if (*p == '$') {    /* translate next template character */
+      p++;
+      if (*p == '$') append(*p); /* special case: $$ */
+      else {
+
+        /* here if we had $x where x must be [0-9A-Z] */
+        if      ((*p >= '0') && (*p <= '9')) x = *p - '0';
+        else if ((*p >= 'A') && (*p <= 'Z')) x = *p - 'A' + 10;
+        else {
+          fprintf(stderr,"invalid capture syntax\n");
+          goto done;
+        }
+
+        if (x > pe) {
+          fprintf(stderr,"capture $%u exceeds $%d\n", x, pe);
+          goto done;
+        }
+
+        /* copy capture $x */
+        l = ovec[x*2+1] - ovec[x*2];
+        if (l > olen) {
+          fprintf(stderr, "capture too large for buffer\n");
+          goto done;
+        }
+        assert(l >= 0);
+        memcpy(o, &file[ovec[x*2]], l);
+        olen -= l;
+        o += l;
+      }
+    } else append(*p); /* copy literal character */
+    p++;
+  }
+
+  append('\0');
+  if (same_file(cfg.opath, file)) goto done;
+  rc = 0;
+
+  if (cfg.dry_run || cfg.verbose) {
+    fprintf(stderr, "%s -> %s\n", file, cfg.opath);
+  }
+
+ done:
+  return rc;
+}
+
+/* the heart of this program is here. we process one filename */
+int process(char *file, size_t len) {
+  int ovec[OVECSZ], rc = -1, pe, l, i, ec;
+
+  /* make a nul terminated string */
+  if (len+1 > sizeof(cfg.tmp)) goto done;
+  memcpy(cfg.tmp, file, len);
+  cfg.tmp[len] = '\0';
+
+  pe = pcre_exec(cfg.re, NULL, file, len, 0, 0, ovec, OVECSZ);
+  if (pe < 0) {
+    if (pe == PCRE_ERROR_NOMATCH) {
+      fprintf(stderr, "skipping %s: not a match for regex\n", cfg.tmp);
+      rc = 0;
+      goto done;
+    }
+    fprintf(stderr, "pcre_exec: error (%d) - see pcreapi(3)\n", pe);
+    goto done;
+  }
   
+  /* captures didn't fit in OVEC */
   if (pe == 0) {
     fprintf(stderr, "error: use fewer captures or increase OVECSZ\n");
     goto done;
@@ -158,11 +357,13 @@ int process(char *file, size_t len) {
   /* pe is the number of substrings captured by pcre_exec including the
    * substring that matched the entire regular expression. see pcreapi(3) */
   assert(pe > 0);
-  if (cfg.verbose) {
-    for(i=0; i < pe*2; i+=2) {
-      c = &file[ovec[i]];
-      l = ovec[i+1]-ovec[i];
-      fprintf(stderr, " $%u matched %.*s\n", i/2, l, c);
+  if (pat2path(cfg.tmp, ovec, pe) < 0) goto done;
+  if (map_copy(cfg.tmp, cfg.opath) < 0) goto done;
+  if (cfg.oring) {
+    ec = shr_write(cfg.oring, cfg.opath, strlen(cfg.opath));
+    if (ec < 0) {
+      fprintf(stderr, "shr_write: error (%d)\n", ec);
+      goto done;
     }
   }
 
@@ -199,11 +400,11 @@ int parse_regex(void) {
   int rc = -1, off;
   const char *err;
 
-  assert(cfg.pattern);
+  assert(cfg.regex);
 
-  cfg.re = pcre_compile(cfg.pattern, 0, &err, &off, NULL);
+  cfg.re = pcre_compile(cfg.regex, 0, &err, &off, NULL);
   if (cfg.re == NULL) {
-    fprintf(stderr, "error in regex %s: %s (offset %u)\n", cfg.pattern, err, off);
+    fprintf(stderr, "error in regex %s: %s (offset %u)\n", cfg.regex, err, off);
     goto done;
   }
 
@@ -219,12 +420,15 @@ int main(int argc, char *argv[]) {
   cfg.prog = argv[0];
   char unit, *c, buf[100];
 
-  while ( (opt = getopt(argc,argv,"vhp:i:")) > 0) {
+  while ( (opt = getopt(argc,argv,"vdht:r:i:o:")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'h': default: usage(); break;
-      case 'p': cfg.pattern = strdup(optarg); break;
+      case 'd': cfg.dry_run=1; break;
+      case 'r': cfg.regex = strdup(optarg); break;
+      case 't': cfg.template = strdup(optarg); break;
       case 'i': cfg.input_ring = strdup(optarg); break;
+      case 'o': cfg.output_ring = strdup(optarg); break;
     }
   }
 
@@ -261,6 +465,11 @@ int main(int argc, char *argv[]) {
   cfg.ring_fd = shr_get_selectable_fd(cfg.ring);
   if (cfg.ring_fd < 0) goto done;
 
+  if (cfg.output_ring) {
+    cfg.oring = shr_open(cfg.output_ring, SHR_WRONLY);
+    if (cfg.oring == NULL) goto done;
+  }
+
   /* add descriptors of interest to epoll */
   if (add_epoll(EPOLLIN, cfg.signal_fd)) goto done;
   if (add_epoll(EPOLLIN, cfg.ring_fd)) goto done;
@@ -284,8 +493,10 @@ int main(int argc, char *argv[]) {
  
  done:
   if (cfg.ring) shr_close(cfg.ring);
+  if (cfg.oring) shr_close(cfg.oring);
   if (cfg.signal_fd != -1) close(cfg.signal_fd);
   if (cfg.epoll_fd != -1) close(cfg.epoll_fd);
   if (cfg.input_ring) free(cfg.input_ring);
+  if (cfg.output_ring) free(cfg.output_ring);
   return 0;
 }
