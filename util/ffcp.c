@@ -41,6 +41,7 @@ struct {
   char *prog;
   int verbose;
   int dry_run;
+  int mkpath;
   int epoll_fd;     /* epoll descriptor */
   int signal_fd;    /* to receive signals */
   int ring_fd;      /* ring readability fd */
@@ -53,7 +54,9 @@ struct {
   char *regex;    /* regex applied to input filenames */
   char *template;   /* basis of output filenames */
   pcre *re;         /* compiled regex */
+  /* these are all work spaces for dealing with paths */
   char tmp[PATH_MAX];
+  char dir[PATH_MAX];
   char rpath1[PATH_MAX];
   char rpath2[PATH_MAX];
   char opath[PATH_MAX];
@@ -85,13 +88,11 @@ void usage() {
                  "   -p <regex>         [default: wildcard, capture basename]\n"
                  "   -t <template>      [default: basename of original]\n"
                  "   -o <output-ring>   [log output filenames to ring]\n"
+                 "   -m                 [create directories in output path]\n"
                  "   -d                 [dry-run; show names, no copying]\n"
                  "   -h                 [this help]\n"
                  "   -v                 [verbose; repeatable]\n"
                  "\n"
-                 "Examples:\n"
-                 "\n"
-                 "ffcp -i in -v -o out -t '/tmp/out/$1'\n"
                  "\n"
                  "\n");
   exit(-1);
@@ -228,22 +229,24 @@ done:
  * -1 on error (not file)
  *
  */
-int same_file(char *path1, char *path2) {
+int same_file(char *newfile, char *srcfile) {
   int rc = -1;
 
-  if (realpath(path1, cfg.rpath1) == NULL) {
-    fprintf(stderr, "realpath: %s: %s\n", path1, strerror(errno));
+  if (realpath(srcfile, cfg.rpath1) == NULL) {
+    fprintf(stderr, "realpath: %s: %s\n", srcfile, strerror(errno));
     goto done;
   }
 
-  if (realpath(path2, cfg.rpath2) == NULL) {
-    fprintf(stderr, "realpath: %s: %s\n", path2, strerror(errno));
+  if (realpath(newfile, cfg.rpath2) == NULL) {
+    /* newfile doesn't exist, or path to it,
+     * so it's not the same file as srcfile */
+    rc = 0;
     goto done;
   }
 
   rc = strcmp(cfg.rpath1, cfg.rpath2) ? 0 : 1;
   if (rc == 1) {
-    fprintf(stderr, "%s and %s are the same file\n", path1, path2);
+    fprintf(stderr, "%s and %s are the same file\n", newfile, srcfile);
     goto done;
   }
 
@@ -274,7 +277,7 @@ int pat2path(char *file, int *ovec, int pe) {
     for(i=0; i < pe*2; i+=2) {
       c = &file[ovec[i]];
       l = ovec[i+1]-ovec[i];
-      fprintf(stderr, " $%u matched %.*s\n", i/2, l, c);
+      fprintf(stderr, " $%u matched %.*s\n", i/2, (int)l, c);
     }
   }
 
@@ -328,6 +331,39 @@ int pat2path(char *file, int *ovec, int pe) {
   return rc;
 }
 
+/* create the directory empty leading up to the basename */
+int mkpath(char *path) {
+  int rc  = -1, ec;
+  struct stat s;
+  char *b, *e;
+  size_t l;
+
+  b = path;
+  e = path;
+  while (1) {
+    while ((*e != '/') && (*e != '\0')) e++;
+    if (*e == '\0') break;
+    l = e-b+1;
+    if (l+1 > sizeof(cfg.dir)) goto done;
+    memcpy(cfg.dir, b, l);
+    cfg.dir[l] = '\0';
+    ec = stat(cfg.dir, &s);
+    if ((ec < 0) && (errno == ENOENT)) {
+      if (cfg.verbose) fprintf(stderr, "creating %s\n", cfg.dir);
+      if (mkdir(cfg.dir, 0777) < 0) {
+        fprintf(stderr, "mkdir %s: %s\n", cfg.dir, strerror(errno));
+        goto done;
+      }
+    }
+    e++;
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
 /* the heart of this program is here. we process one filename */
 int process(char *file, size_t len) {
   int ovec[OVECSZ], rc = -1, pe, l, i, ec;
@@ -358,6 +394,7 @@ int process(char *file, size_t len) {
    * substring that matched the entire regular expression. see pcreapi(3) */
   assert(pe > 0);
   if (pat2path(cfg.tmp, ovec, pe) < 0) goto done;
+  if (cfg.mkpath && (mkpath(cfg.opath) < 0)) goto done;
   if (map_copy(cfg.tmp, cfg.opath) < 0) goto done;
   if (cfg.oring) {
     ec = shr_write(cfg.oring, cfg.opath, strlen(cfg.opath));
@@ -420,11 +457,12 @@ int main(int argc, char *argv[]) {
   cfg.prog = argv[0];
   char unit, *c, buf[100];
 
-  while ( (opt = getopt(argc,argv,"vdht:r:i:o:")) > 0) {
+  while ( (opt = getopt(argc,argv,"vmdht:r:i:o:")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'h': default: usage(); break;
       case 'd': cfg.dry_run=1; break;
+      case 'm': cfg.mkpath=1; break;
       case 'r': cfg.regex = strdup(optarg); break;
       case 't': cfg.template = strdup(optarg); break;
       case 'i': cfg.input_ring = strdup(optarg); break;
