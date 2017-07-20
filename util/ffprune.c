@@ -64,7 +64,7 @@ struct {
   size_t sz;        /* byte size to prune to */
   char dir[PATH_MAX]; /* tree to prune (realpath) */
   char cur[PATH_MAX]; /* current file when ring */
-  char tmp[PATH_MAX]; /* temp used in unlink_path */
+  char tmp[PATH_MAX]; /* used in add and unlink_path */
   size_t tree_max_M; /* max nodes in tree, in millions */
   struct node *all_nodes;  /* malloc allocation of nodes */
   struct node *free_nodes; /* linked list of free nodes */
@@ -94,15 +94,18 @@ void usage() {
                  "the directory, from a compatible application (e.g. ffcp)\n"
                  "that writes the filenames into the ring buffer specified.\n"
                  "\n"
+                 "If the ring buffer is not passed in, then this tool does\n"
+                 "a single round of pruning and exits.\n"
+                 "\n"
                  "An estimate of the maxinum number of files that may occupy\n"
                  "the directory hierarchy, rounded up to the nearest million,\n"
                  "is given to the -M argument (e.g. 1 = 1M files). This number\n"
                  "determines the size of the internal file tracking table.\n"
                  "\n");
-  fprintf(stderr,"usage: %s -i <ring> -s <size> [options] <directory>\n\n", cfg.prog);
+  fprintf(stderr,"usage: %s -s <size> [options] <directory>\n\n", cfg.prog);
   fprintf(stderr,"options:\n"
-                 "   -i <input-ring>    [ring of filenames entering tree]\n"
                  "   -s <max-size>      [size to prune to, units k/m/g/t/%]\n"
+                 "   -i <input-ring>    [ring of filenames incoming to tree]\n"
                  "   -M                 [max files, in millions; default: 1M]\n"
                  "   -h                 [this help]\n"
                  "   -v                 [verbose; repeatable]\n"
@@ -181,6 +184,10 @@ int periodic_work(void) {
   int rc = -1;
 
   if (do_attrition() < 0) goto done;
+
+  /* one-shot mode? induce program exit */
+  if (cfg.input_ring == NULL) goto done;
+
   rc = 0;
 
  done:
@@ -376,47 +383,44 @@ int mtime_sort(struct node *a, struct node *b) {
   return 0;
 }
 
-/* add a file to the tree.
- * if dir is non-NULL, its the dirname from which file is relative
- */
-int add(char *dir, char *file) {
-  char path[FF_PATH_MAX];
-  size_t l, dl, plen;
+int add(char *file) {
   int rc = -1, ec;
   struct node *n;
   struct stat s;
+  size_t l, d;
 
-  /* canonicalize ./file to file */
-  if (!strncmp(file, "./", 2)) file += 2;
-
-  dl = dir ? strlen(dir) : 0;
-  l =  strlen(file);
-  if (dl+1+l+1 > FF_PATH_MAX) {
-    fprintf(stderr, "path too long: %s\n", file);
+  /* canonicalize to an absolute path. only abs paths in hash */
+  if (realpath(file, cfg.tmp) == NULL) {
+    fprintf(stderr, "realpath %s: %s\n", file, strerror(errno));
     goto done;
   }
 
-  /* formulate path as <dir>/<file> */
-  if (dir) {
-    memcpy(path, dir, dl);
-    path[dl] = '/';
+  /* verify that file is under the directory tree we monitor */
+  d = strlen(cfg.dir);
+  if ((memcmp(cfg.dir, cfg.tmp, d)) || (cfg.tmp[d] != '/')) {
+    fprintf(stderr, "file %s not in directory %s\n", cfg.tmp, cfg.dir);
+    goto done;
   }
-  memcpy(path + (dir ? dl+1 : 0), file, l+1); /* acquires nul terminator from file */
-  plen = (dir ? dl + 1 : 0) + l+1;            /* path len including nul terminator */
 
-  ec = stat(path, &s);
+  l = strlen(cfg.tmp);
+  if (l+1 > FF_PATH_MAX) {
+    fprintf(stderr, "path too long: %s\n", cfg.tmp);
+    goto done;
+  }
+
+  ec = stat(cfg.tmp, &s);
   if (ec < 0) {
-    fprintf(stderr, "stat: %s: %s\n", path, strerror(errno));
+    fprintf(stderr, "stat: %s: %s\n", cfg.tmp, strerror(errno));
     goto done;
   }
 
   if (S_ISREG(s.st_mode) == 0) {
-    fprintf(stderr, "not a regular file: %s\n", path);
+    fprintf(stderr, "not a regular file: %s\n", cfg.tmp);
     goto done;
   }
 
   /* if file is known already, update; otherwise create record */
-  HASH_FIND_STR(cfg.tree_nodes, path, n);
+  HASH_FIND_STR(cfg.tree_nodes, cfg.tmp, n);
   if (n == NULL) {
 
     if (cfg.free_nodes == NULL) {
@@ -427,7 +431,7 @@ int add(char *dir, char *file) {
     /* claim a free node. remove it from the free list */
     n = cfg.free_nodes;
     DL_DELETE2(cfg.free_nodes, n, fprev, fnext);
-    memcpy(n->name, path, plen);
+    memcpy(n->name, cfg.tmp, l+1);
     HASH_ADD_STR(cfg.tree_nodes, name, n);
   }
 
@@ -442,52 +446,51 @@ int add(char *dir, char *file) {
 }
 
 /* add directory to tree , causing recursive addition of
- * directories and files inside it. the parent argument
- * is NULL (if dir is to be opened directly) or is a path
- * from which dir should be considered relative */
-int add_dir(char *parent, char *dir) {
+ * directories and files inside it. */
+int add_dir(char *dir) {
   char path[FF_PATH_MAX];
   struct dirent *dent;
   int rc = -1, ec;
+  struct stat s;
+  size_t l, el;
   DIR *d = NULL;
-  size_t l, pl, fl;
 
   l = strlen(dir);
-  pl = parent ? strlen(parent) + 1 : 0;
-  fl = pl + l;
-  if (fl+1 > FF_PATH_MAX) {
-    fprintf(stderr, "path too long\n");
-    goto done;
-  }
-  if (parent && pl) {
-    memcpy(path, parent, pl);
-    path[pl-1] = '/';
-  }
-  memcpy(path + pl, dir, l+1); /* gets nul from dir */
 
-  d = opendir(path);
+  d = opendir(dir);
   if (d == NULL) {
-    fprintf(stderr, "opendir %s: %s\n", path, strerror(errno));
+    fprintf(stderr, "opendir %s: %s\n", dir, strerror(errno));
     goto done;
   }
 
-  /* iterate over directory contents */
+  /* iterate over directory contents. use stat to distinguish regular files
+   * from directories (etc). stat is more robust than using dent->d_type */
   while ( (dent = readdir(d)) != NULL) {
-    switch(dent->d_type) {
-      case DT_DIR:
-        /* skip the . and .. directories */
-        if (!strcmp(dent->d_name, "."))  continue;
-        if (!strcmp(dent->d_name, "..")) continue;
-        /* fs depth bounds recursion */
-        if (add_dir(path, dent->d_name) < 0) goto done;
-        break;
-      case DT_REG:
-        if (add(path, dent->d_name) < 0) goto done;
-        break;
-      default:
-        fprintf(stderr, "skipping special file: %s/%s\n", path, dent->d_name);
-        break;
+
+    /* skip the . and .. directories */
+    if (!strcmp(dent->d_name, "."))  continue;
+    if (!strcmp(dent->d_name, "..")) continue;
+
+    /* formulate path to dir entry */
+    el = strlen(dent->d_name);
+    if (l+1+el+1 > FF_PATH_MAX) {
+      fprintf(stderr, "path too long: %s/%s\n", dir, dent->d_name);
+      goto done;
     }
+    memcpy(path, dir, l);
+    path[l] = '/';
+    memcpy(&path[l+1], dent->d_name, el+1);
+
+    /* lstat to determine its type */
+    ec = lstat(path, &s);
+    if (ec < 0) {
+      fprintf(stderr, "lstat %s: %s\n", path, strerror(errno));
+      goto done;
+    }
+
+    if (S_ISDIR(s.st_mode))  { if (add_dir(path) < 0) goto done; }
+    else if (S_ISREG(s.st_mode)) { if (add(path) < 0) goto done; }
+    else fprintf(stderr, "skipping special file: %s\n", path);
   }
 
   rc = 0;
@@ -506,7 +509,7 @@ int process(char *file, size_t len) {
   memcpy(cfg.cur, file, len);
   cfg.cur[len] = '\0';
 
-  ec = add(NULL, cfg.cur);
+  ec = add(cfg.cur);
   if (ec < 0) goto done;
 
   rc = 0;
@@ -533,7 +536,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  /* grab the directory to monitor and canonicalize it */
+  /* form canonical realpath of dir to monitor */
   if (optind < argc) {
     l = strlen( argv[optind] );
     if (l+1 > sizeof(cfg.tmp)) {
@@ -542,18 +545,15 @@ int main(int argc, char *argv[]) {
     }
     memcpy(cfg.tmp, argv[optind], l);
     cfg.tmp[l] = '\0';
-
     if (realpath(cfg.tmp, cfg.dir) == NULL) {
       fprintf(stderr, "realpath %s: %s\n", cfg.tmp, strerror(errno));
       goto done;
     }
-
     optind++;
   } else usage();
 
   if ((sz == NULL) || (parse_sz(sz) < 0)) usage();
   if (cfg.sz == 0) usage();
-  if (cfg.input_ring == NULL) usage();
 
   size_t tree_sz = cfg.tree_max_M * 1000000 * sizeof(struct node);
 
@@ -577,7 +577,7 @@ int main(int argc, char *argv[]) {
   }
   
   /* add directory root to the tree and initiate scan */
-  if (add_dir(NULL, cfg.dir) < 0) goto done;
+  if (add_dir(cfg.dir) < 0) goto done;
   if (cfg.verbose) fprintf(stderr, "initial scan complete\n");
 
   /* block all signals. we accept signals via signal_fd */
@@ -604,16 +604,17 @@ int main(int argc, char *argv[]) {
     goto done;
   }
 
-  /* open the ring */
-  cfg.ring = shr_open(cfg.input_ring, SHR_RDONLY|SHR_NONBLOCK);
-  if (cfg.ring == NULL) goto done;
-  cfg.ring_fd = shr_get_selectable_fd(cfg.ring);
-  if (cfg.ring_fd < 0) goto done;
-
   /* add descriptors of interest to epoll */
   if (add_epoll(EPOLLIN, cfg.signal_fd)) goto done;
-  if (add_epoll(EPOLLIN, cfg.ring_fd)) goto done;
 
+  /* open the ring */
+  if (cfg.input_ring) {
+    cfg.ring = shr_open(cfg.input_ring, SHR_RDONLY|SHR_NONBLOCK);
+    if (cfg.ring == NULL) goto done;
+    cfg.ring_fd = shr_get_selectable_fd(cfg.ring);
+    if (cfg.ring_fd < 0) goto done;
+    if (add_epoll(EPOLLIN, cfg.ring_fd)) goto done;
+  }
 
   alarm(1);
 
