@@ -85,7 +85,7 @@ void usage() {
   fprintf(stderr,"usage: %s <options>\n\n", cfg.prog);
   fprintf(stderr,"options:\n"
                  "   -i <input-ring>    [required; input filenames in ring]\n"
-                 "   -p <regex>         [default: wildcard, capture basename]\n"
+                 "   -r <regex>         [default: wildcard, capture basename]\n"
                  "   -t <template>      [default: basename of original]\n"
                  "   -o <output-ring>   [log output filenames to ring]\n"
                  "   -m                 [create directories in output path]\n"
@@ -337,6 +337,11 @@ int mkpath(char *path) {
   struct stat s;
   char *b, *e;
   size_t l;
+
+  if (cfg.dry_run) {
+    rc = 0;
+    goto done;
+  }
 
   b = path;
   e = path;

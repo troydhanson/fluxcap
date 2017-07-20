@@ -1,10 +1,13 @@
 srcdir = @srcdir@
 
-bin_PROGRAMS = ramdisk watch_copy
+bin_PROGRAMS = ramdisk watch_copy ffprune
 ramdisk_SOURCES = ramdisk.c
 ramdisk_CPPFLAGS = -I$(srcdir)/../lib/libut/include 
 
 watch_copy_SOURCES = watch_copy.c
+
+ffprune_CPPFLAGS = -I$(srcdir)/../lib/libut/include
+ffprune_LDADD = -L../lib -lut -lshr
 
 if HAVE_PCRE
 bin_PROGRAMS += ffcp
