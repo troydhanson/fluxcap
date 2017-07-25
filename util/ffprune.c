@@ -445,12 +445,16 @@ int add(char *file) {
   return rc;
 }
 
-/* add directory to tree , causing recursive addition of
- * directories and files inside it. */
+/* add directory to tree, recursively. 
+ *
+ * returns
+ *   < 0 on error
+ *   >= 0 the number of files+directories in dir
+ */
 int add_dir(char *dir) {
+  int rc = -1, ec, n=0, f;
   char path[FF_PATH_MAX];
   struct dirent *dent;
-  int rc = -1, ec;
   struct stat s;
   size_t l, el;
   DIR *d = NULL;
@@ -488,16 +492,37 @@ int add_dir(char *dir) {
       goto done;
     }
 
-    if (S_ISDIR(s.st_mode))  { if (add_dir(path) < 0) goto done; }
-    else if (S_ISREG(s.st_mode)) { if (add(path) < 0) goto done; }
-    else fprintf(stderr, "skipping special file: %s\n", path);
+    /* dir? add recursively. if it was empty, prune it */
+    if (S_ISDIR(s.st_mode))  {
+      f = add_dir(path);
+      if (f < 0) goto done;
+      if (f == 0) {
+        fprintf(stderr, "pruning empty directory %s\n", path);
+        ec = rmdir(path);
+        if (ec < 0) {
+          fprintf(stderr, "rmdir %s: %s\n", path, strerror(errno));
+          goto done;
+        }
+      }
+      if (f > 0) n++;
+    }
+    else if (S_ISREG(s.st_mode)) { /* regular file */
+      if (add(path) < 0) goto done;
+      n++;
+    }
+    else {
+      /* we will never attrition a special file */
+      fprintf(stderr, "special file: %s\n", path);
+      n++;
+    }
+
   }
 
   rc = 0;
 
  done:
   if (d) closedir(d);
-  return rc;
+  return rc ? rc : n;
 }
 
 /* the heart of this program is here. we process one filename */
