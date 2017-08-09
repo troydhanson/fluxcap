@@ -43,6 +43,17 @@ else
   AM_CONDITIONAL(HAVE_PCRE,true)
 fi
 
+have_zlib_header=n
+have_zlib_lib=n
+AC_CHECK_HEADERS([zlib.h],[have_zlib_header=y])
+AC_CHECK_LIB(z,deflate,[have_zlib_lib=y])
+if test "x${have_zlib_header}${have_zlib_lib}" != xyy
+then
+  AM_CONDITIONAL(HAVE_ZLIB,false)
+else
+  AM_CONDITIONAL(HAVE_ZLIB,true)
+fi
+
 AC_CONFIG_FILES([Makefile
    util/Makefile
    lib/Makefile

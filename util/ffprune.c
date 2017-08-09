@@ -61,7 +61,8 @@ struct {
   struct shr *ring; /* open ring handle */
   char *buf;        /* buf for shr_readv */
   struct iovec *iov;/* iov for shr_readv */
-  size_t sz;        /* byte size to prune to */
+  size_t max;       /* byte size to prune to */
+  size_t sz;        /* current sum of file sizes in tree */
   char dir[PATH_MAX]; /* tree to prune (realpath) */
   char cur[PATH_MAX]; /* current file when ring */
   char tmp[PATH_MAX]; /* used in add and unlink_path */
@@ -138,37 +139,16 @@ int del_epoll(int fd) {
   return rc;
 }
 
-/* scan the struct nodes in active use, and 
- * calculate what attrition is needed to honor cfg.sz
- */
 int do_attrition(void) {
-  size_t tree_sz = 0, tree_count = 0;
   struct node *n, *tmp;
   int rc = -1;
 
-  HASH_ITER(hh, cfg.tree_nodes, n, tmp) {
-    tree_sz += n->sz;
-    tree_count++;
-  }
-
-  if (cfg.verbose) {
-    fprintf(stderr, "tree:\n");
-    fprintf(stderr, " %ld items\n", (long)tree_count);
-    fprintf(stderr, " %ld bytes\n", (long)tree_sz);
-  }
-
-  if (tree_sz < cfg.sz) {  /* sufficient free space? */
-    rc = 0;
-    goto done;
-  }
-
-  /* need to liberate space. sort by age and unlink */
-  HASH_SORT(cfg.tree_nodes, mtime_sort);
-  while(tree_sz > cfg.sz) {
+  /* liberate space. unlink oldest */
+  while(cfg.sz > cfg.max) {
     n = cfg.tree_nodes;
-    assert(n && (tree_sz >= n->sz));
+    assert(n && (cfg.sz >= n->sz));
     if (unlink_path(n->name, 0) < 0) goto done;
-    tree_sz -= n->sz;
+    cfg.sz -= n->sz;
     HASH_DEL(cfg.tree_nodes, n);   /* take structure off active hash */
     DL_APPEND2(cfg.free_nodes, n, fprev, fnext); /* put on free list */
   }
@@ -287,7 +267,7 @@ int parse_sz(char *sz) {
     }
   }
 
-  cfg.sz = n;
+  cfg.max = n;
   rc = 0;
 
  done:
@@ -419,25 +399,31 @@ int add(char *file) {
     goto done;
   }
 
-  /* if file is known already, update; otherwise create record */
+  /* if file is known already, we remove its record momentarily,
+   * (and subtract its contribution from cfg.sz, the tree size),
+   * then we re-add it to the file hash.  we do this because the
+   * re-addition inserts into the correct sorted position, since
+   * its mtime may have changed (as well as its size, of course). 
+   */
   HASH_FIND_STR(cfg.tree_nodes, cfg.tmp, n);
-  if (n == NULL) {
-
+  if (n) {
+    HASH_DEL(cfg.tree_nodes, n);
+    cfg.sz -= n->sz;
+  } else {
+    /* claim a free node. remove it from the free list */
     if (cfg.free_nodes == NULL) {
       fprintf(stderr, "nodes exhausted, increase -M\n");
       goto done;
     }
-
-    /* claim a free node. remove it from the free list */
     n = cfg.free_nodes;
     DL_DELETE2(cfg.free_nodes, n, fprev, fnext);
     memcpy(n->name, cfg.tmp, l+1);
-    HASH_ADD_STR(cfg.tree_nodes, name, n);
   }
 
-  /* update fields for nodes */
   n->mtime = s.st_mtim.tv_sec;
   n->sz = s.st_size;
+  HASH_ADD_INORDER(hh, cfg.tree_nodes, name, l, n, mtime_sort);
+  cfg.sz += s.st_size;
 
   rc = 0;
 
@@ -548,6 +534,7 @@ int main(int argc, char *argv[]) {
   int opt, rc=-1, n, ec;
   struct epoll_event ev;
   cfg.prog = argv[0];
+  time_t t1, t2;
   size_t l;
   off_t i;
 
@@ -578,13 +565,13 @@ int main(int argc, char *argv[]) {
   } else usage();
 
   if ((sz == NULL) || (parse_sz(sz) < 0)) usage();
-  if (cfg.sz == 0) usage();
+  if (cfg.max == 0) usage();
 
   size_t tree_sz = cfg.tree_max_M * 1000000 * sizeof(struct node);
 
   if (cfg.verbose) {
     fprintf(stderr, "tree  : %s\n", cfg.dir);
-    fprintf(stderr, "max sz: %lu MB\n", (long)(cfg.sz >> 20));
+    fprintf(stderr, "max sz: %lu MB\n", (long)(cfg.max >> 20));
     fprintf(stderr, "table : %luM nodes\n", cfg.tree_max_M);
     fprintf(stderr, "table : %lu MB\n", (long)(tree_sz >> 20));
   }
@@ -601,9 +588,14 @@ int main(int argc, char *argv[]) {
     DL_APPEND2(cfg.free_nodes, &cfg.all_nodes[i], fprev, fnext);
   }
   
-  /* add directory root to the tree and initiate scan */
+  /* recurse into the directory tree to get files' sizes/ages, */
+  /* then age-sort all files. future insertions preserve sort */
+  time(&t1);
   if (add_dir(cfg.dir) < 0) goto done;
-  if (cfg.verbose) fprintf(stderr, "initial scan complete\n");
+  HASH_SORT(cfg.tree_nodes, mtime_sort);
+  time(&t2);
+
+  fprintf(stderr, "directory scan complete (%ld secs)\n", t2-t1);
 
   /* block all signals. we accept signals via signal_fd */
   sigset_t all;

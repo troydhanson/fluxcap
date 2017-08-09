@@ -10,10 +10,12 @@ ffprune_CPPFLAGS = -I$(srcdir)/../lib/libut/include
 ffprune_LDADD = -L../lib -lut -lshr
 
 if HAVE_PCRE
+if HAVE_ZLIB
 bin_PROGRAMS += ffcp
 ffcp_SOURCES = ffcp.c
 ffcp_CPPFLAGS = -I$(srcdir)/../lib/libut/include
-ffcp_LDADD = -L../lib -lut -lshr -lpcre
+ffcp_LDADD = -L../lib -lut -lshr -lpcre -lz
+endif
 endif
 
 if HAVE_NCURSES

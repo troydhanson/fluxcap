@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <pcre.h>
 #include <time.h>
+#include <zlib.h>
 #include "shr.h"
 
 #define OVECSZ 30 /* must be multiple of 3 */
@@ -28,7 +29,7 @@
  * reads filenames from input shr ring
  * transforms file name via regex to dest path
  * copies to dest path, making directories as needed
- * writes output file to secondary shr ring optionally
+ * writes output filename to secondary ring optionally
  */
 
 #define BATCH_FRAMES 10000
@@ -41,6 +42,7 @@ struct {
   char *prog;
   int verbose;
   int dry_run;
+  int gzip;
   int mkpath;
   int epoll_fd;     /* epoll descriptor */
   int signal_fd;    /* to receive signals */
@@ -89,6 +91,7 @@ void usage() {
                  "   -t <template>      [default: basename of original]\n"
                  "   -o <output-ring>   [log output filenames to ring]\n"
                  "   -m                 [create directories in output path]\n"
+                 "   -z                 [gzip the output file]\n"
                  "   -d                 [dry-run; show names, no copying]\n"
                  "   -h                 [this help]\n"
                  "   -v                 [verbose; repeatable]\n"
@@ -154,6 +157,110 @@ int handle_signal(void) {
  rc = 0;
 
  done:
+  return rc;
+}
+
+#define want_gzip 16
+#define def_windowbits (15 + want_gzip)
+#define def_memlevel 8
+int zip_copy(char *file, char *dest) {
+  int fd=-1,dd=-1,rc=-1,ec;
+  char *src=NULL,*dst=NULL;
+  struct stat s;
+  size_t zmax;
+
+  if (cfg.dry_run) {
+    rc = 0;
+    goto done;
+  }
+
+  /* source file */
+  if ( (fd = open(file, O_RDONLY)) == -1) {
+    fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
+    goto done;
+  }
+  if (fstat(fd, &s) == -1) {
+    fprintf(stderr,"can't stat %s: %s\n", file, strerror(errno));
+    goto done;
+  }
+  if (!S_ISREG(s.st_mode)) {
+    fprintf(stderr,"not a regular file: %s\n", file);
+    goto done;
+  }
+
+  /* dest file */
+  if ( (dd = open(dest, O_RDWR|O_TRUNC|O_CREAT, 0644)) == -1) {
+    fprintf(stderr,"can't open %s: %s\n", dest, strerror(errno));
+    goto done;
+  }
+
+  /* map source */
+  src = s.st_size ? mmap(0, s.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+  if (src == MAP_FAILED) {
+    fprintf(stderr, "mmap %s: %s\n", file, strerror(errno));
+    goto done;
+  }
+
+  /* minimal required initialization of z_stream prior to deflateInit2 */
+  z_stream zs = {.next_in = src, .zalloc=Z_NULL, .zfree=Z_NULL, .opaque=NULL};
+  ec = deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, def_windowbits,
+               def_memlevel, Z_DEFAULT_STRATEGY);
+  if (ec != Z_OK) {
+    fprintf(stderr, "deflateInit2 failed: %s\n", zs.msg);
+    goto done;
+  }
+
+  /* calculate the max space needed to deflate this buffer in a single pass */
+  zmax = deflateBound(&zs, s.st_size);
+
+  /* map the output file at the max size we might need. */
+  if (ftruncate(dd, zmax) == -1) {
+    fprintf(stderr,"ftruncate: %s\n", strerror(errno));
+    goto done;
+  }
+  dst = mmap(0, zmax, PROT_READ|PROT_WRITE, MAP_SHARED, dd, 0);
+  if (dst == MAP_FAILED) {
+    fprintf(stderr, "mmap %s: %s\n", dest, strerror(errno));
+    goto done;
+  }
+
+  /* prepare to deflate */
+  zs.avail_in = s.st_size;
+  zs.next_out = dst;
+  zs.avail_out = zmax;
+
+  /* deflate it in one fell swoop */
+  ec = deflate(&zs, Z_FINISH);
+  if (ec != Z_STREAM_END) {
+    fprintf(stderr, "single-pass deflate failed: ");
+    if (ec == Z_OK) fprintf(stderr, "additional passes needed\n");
+    else if (ec == Z_STREAM_ERROR) fprintf(stderr,"stream error\n");
+    else if (ec == Z_BUF_ERROR) fprintf(stderr,"buffer unavailable\n");
+    else fprintf(stderr,"unknown error\n");
+    goto done;
+  }
+
+  ec = deflateEnd(&zs);
+  if (ec != Z_OK) {
+    fprintf(stderr,"deflateEnd: %s\n", zs.msg);
+    goto done;
+  }
+
+  /* unmap and truncate the output file to the compressed length */
+  munmap(dst, zmax);
+  dst = NULL;
+  if (ftruncate(dd, zs.total_out) == -1) {
+    fprintf(stderr,"ftruncate: %s\n", strerror(errno));
+    goto done;
+  }
+
+  rc = 0;
+
+done:
+  if (src && (src != MAP_FAILED)) munmap(src, s.st_size);
+  if (dst && (dst != MAP_FAILED)) munmap(dst, zmax);
+  if (fd != -1) close(fd);
+  if (dd != -1) close(dd);
   return rc;
 }
 
@@ -400,7 +507,11 @@ int process(char *file, size_t len) {
   assert(pe > 0);
   if (pat2path(cfg.tmp, ovec, pe) < 0) goto done;
   if (cfg.mkpath && (mkpath(cfg.opath) < 0)) goto done;
-  if (map_copy(cfg.tmp, cfg.opath) < 0) goto done;
+
+  ec = cfg.gzip ? zip_copy(cfg.tmp, cfg.opath) : 
+                  map_copy(cfg.tmp, cfg.opath);
+  if (ec < 0) goto done;
+
   if (cfg.oring) {
     ec = shr_write(cfg.oring, cfg.opath, strlen(cfg.opath));
     if (ec < 0) {
@@ -462,12 +573,13 @@ int main(int argc, char *argv[]) {
   cfg.prog = argv[0];
   char unit, *c, buf[100];
 
-  while ( (opt = getopt(argc,argv,"vmdht:r:i:o:")) > 0) {
+  while ( (opt = getopt(argc,argv,"vmdht:r:i:o:z")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'h': default: usage(); break;
       case 'd': cfg.dry_run=1; break;
       case 'm': cfg.mkpath=1; break;
+      case 'z': cfg.gzip=1; break;
       case 'r': cfg.regex = strdup(optarg); break;
       case 't': cfg.template = strdup(optarg); break;
       case 'i': cfg.input_ring = strdup(optarg); break;
