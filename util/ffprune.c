@@ -41,7 +41,7 @@
 char read_buffer[BATCH_BYTES];
 struct iovec read_iov[BATCH_FRAMES];
 
-#define FF_PATH_MAX 256
+#define FF_PATH_MAX 100
 /* one of these for every node in the directory tree */
 struct node {
   char name[FF_PATH_MAX];
@@ -88,7 +88,9 @@ void usage() {
                  "This tool continuously attritions files in the directory\n"
                  "hierarchy specified, to maintain a total size under the\n"
                  "size specified in the -s argument. It attritions files,\n"
-                 "by age, and prunes directories that it empties in doing so.\n"
+                 "by age, and deletes subdirectories once they are empty.\n"
+                 "It also enforces a limit on the total number of files in\n"
+                 "the directory hierarchy.\n"
                  "\n"
                  "An initial scan of the directory is done at start up time.\n"
                  "Thereafter, this daemon must be told about files placed into\n"
@@ -98,18 +100,18 @@ void usage() {
                  "If the ring buffer is not passed in, then this tool does\n"
                  "a single round of pruning and exits.\n"
                  "\n"
-                 "An estimate of the maxinum number of files that may occupy\n"
-                 "the directory hierarchy, rounded up to the nearest million,\n"
-                 "is given to the -M argument (e.g. 1 = 1M files). This number\n"
-                 "determines the size of the internal file tracking table.\n"
+                 "The maximum number of files that may occupy the directory\n"
+                 "hierarchy, rounded up to the nearest million, is given by\n"
+                 "the -M argument (e.g. 1 = 1M files). This directly affects\n"
+                 "memory needed.\n"
                  "\n");
   fprintf(stderr,"usage: %s -s <size> [options] <directory>\n\n", cfg.prog);
   fprintf(stderr,"options:\n"
                  "   -s <max-size>      [size to prune to, units k/m/g/t/%]\n"
-                 "   -i <input-ring>    [ring of filenames incoming to tree]\n"
                  "   -M                 [max files, in millions; default: 1M]\n"
-                 "   -h                 [this help]\n"
+                 "   -i <input-ring>    [incoming filename ring; optional]\n"
                  "   -v                 [verbose; repeatable]\n"
+                 "   -h                 [this help]\n"
                  "\n"
                  "\n"
                  "\n");
@@ -410,12 +412,20 @@ int add(char *file) {
     HASH_DEL(cfg.tree_nodes, n);
     cfg.sz -= n->sz;
   } else {
-    /* claim a free node. remove it from the free list */
+
+    /* we need a node structure. if need be, free one up */
     if (cfg.free_nodes == NULL) {
-      fprintf(stderr, "nodes exhausted, increase -M\n");
-      goto done;
+      n = cfg.tree_nodes;
+      assert(n && (cfg.sz >= n->sz));
+      if (unlink_path(n->name, 0) < 0) goto done;
+      cfg.sz -= n->sz;
+      HASH_DEL(cfg.tree_nodes, n);   /* take structure off active hash */
+      DL_APPEND2(cfg.free_nodes, n, fprev, fnext); /* put on free list */
     }
+
+    /* claim a free node. remove it from the free list */
     n = cfg.free_nodes;
+    assert(n);
     DL_DELETE2(cfg.free_nodes, n, fprev, fnext);
     memcpy(n->name, cfg.tmp, l+1);
   }
