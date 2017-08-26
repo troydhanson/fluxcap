@@ -54,6 +54,17 @@ else
   AM_CONDITIONAL(HAVE_ZLIB,true)
 fi
 
+have_sqlite3_header=n
+have_sqlite3_lib=n
+AC_CHECK_HEADERS([sqlite3.h],[have_sqlite3_header=y])
+AC_CHECK_LIB(sqlite3,sqlite3_open,[have_sqlite3_lib=y])
+if test "x${have_sqlite3_header}${have_sqlite3_lib}" != xyy
+then
+  AM_CONDITIONAL(HAVE_SQLITE3,false)
+else
+  AM_CONDITIONAL(HAVE_SQLITE3,true)
+fi
+
 AC_CONFIG_FILES([Makefile
    util/Makefile
    lib/Makefile
