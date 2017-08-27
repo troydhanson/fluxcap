@@ -56,8 +56,9 @@ struct iovec read_iov[BATCH_FRAMES];
 #define OP_LOG_UP   5
 #define OP_ERR_UP   6
 #define OP_DEBUG_UP 7
+#define OP_SCAN_ADD 8
+#define OP_SCAN_END 9
 
-#define FF_PATH_MAX 100
 struct {
   char *prog;
   int verbose;
@@ -75,9 +76,16 @@ struct {
   char old[PATH_MAX]; /* oldest file, next to attrition */
   char cur[PATH_MAX]; /* current file when reading ring */
   char tmp[PATH_MAX]; /* temp in add and unlink_path */
-  int down_pipe[2]; /* pipe for parent-to-worker comms */
-  int up_pipe[2];   /* pipe for worker-to-parent comms */
+  char lod[PATH_MAX]; /* last-old file, to avoid repeating */
+  uint64_t lsz;       /* last-old file sz */
+  int dn_work[2];   /* pipe for parent-to-worker comms */
+  int up_work[2];   /* pipe for worker-to-parent comms */
+  int dn_scan[2];   /* pipe for parent-to-scanner */
+  int up_scan[2];   /* pipe for worker-to-scanner */
   time_t now;
+  pid_t worker_pid;
+  pid_t scanner_pid;
+  struct timespec scanner_pause;
 } cfg = {
   .buf = read_buffer,
   .iov = read_iov,
@@ -85,8 +93,11 @@ struct {
   .signal_fd = -1,
   .ring_fd = -1,
   .db_name = "fprune.db",
-  .down_pipe = {-1,-1},
-  .up_pipe = {-1,-1},
+  .dn_work = {-1,-1},
+  .up_work = {-1,-1},
+  .dn_scan = {-1,-1},
+  .up_scan = {-1,-1},
+  .scanner_pause = {.tv_nsec= 10000000}, /* 1/100th second */
 };
 
 /* signals that we'll accept via signalfd in epoll */
@@ -150,9 +161,6 @@ int w_exec_sql(sqlite3 *db, char *sql) {
   sqlite3_stmt *stmt=NULL;
   int sc, rc = -1;
 
-  w_report_up(OP_DEBUG_UP, "executing sql:", 0);
-  w_report_up(OP_DEBUG_UP, sql, 0);
-
   sc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
   if( sc!=SQLITE_OK ){
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
@@ -177,6 +185,28 @@ int w_exec_sql(sqlite3 *db, char *sql) {
   return rc;
 }
 
+/* push purge down upon completion of fs scan */
+int push_purge_down(uint64_t scan_start_ts) {
+  int rc = -1, op, ec;
+  tpl_node *tn=NULL;
+
+  op = OP_PURGE;
+  tn = tpl_map("iU", &op, &scan_start_ts);
+  if (tn == NULL) goto done;
+  tpl_pack(tn, 0);
+  ec = tpl_dump(tn, TPL_FD, cfg.dn_work[W]);
+  if (ec < 0) {
+    fprintf(stderr,"tpl_dump: error %d\n", ec);
+    goto done;
+  }
+
+  rc = 0;
+
+ done:
+  if (tn) tpl_free(tn);
+  return rc;
+}
+
 /* push unlink of file down to worker */
 int push_unlink_down(char *name) {
   int rc = -1, op, ec;
@@ -186,7 +216,7 @@ int push_unlink_down(char *name) {
   tn = tpl_map("is", &op, &name);
   if (tn == NULL) goto done;
   tpl_pack(tn, 0);
-  ec = tpl_dump(tn, TPL_FD, cfg.down_pipe[W]);
+  ec = tpl_dump(tn, TPL_FD, cfg.dn_work[W]);
   if (ec < 0) {
     fprintf(stderr,"tpl_dump: error %d\n", ec);
     goto done;
@@ -213,7 +243,7 @@ int push_update_down(char *name, time_t mtime, size_t sz) {
   tn = tpl_map("isUUU", &op, &name, &file_sz, &file_mtime, &file_stattime);
   if (tn == NULL) goto done;
   tpl_pack(tn, 0);
-  ec = tpl_dump(tn, TPL_FD, cfg.down_pipe[W]);
+  ec = tpl_dump(tn, TPL_FD, cfg.dn_work[W]);
   if (ec < 0) {
     fprintf(stderr,"tpl_dump: error %d\n", ec);
     goto done;
@@ -291,6 +321,57 @@ int maintain(void) {
  done:
   return rc;
 }
+
+/* scanner has sent us a message up the pipe */
+int handle_scanner(void) {
+  tpl_node *tn=NULL;
+  char *text = NULL;
+  uint64_t timestamp;
+  int rc = -1, op;
+
+  tn = tpl_map("isU", &op, &text, &timestamp);
+  if (tn == NULL) goto done;
+  if (tpl_load(tn, TPL_FD, cfg.up_scan[R]) < 0) goto done;
+  tpl_unpack(tn, 0);
+
+  switch(op) {
+    case OP_SCAN_ADD:
+      if (cfg.verbose > 1) fprintf(stderr, "scanner: add %s\n", text);
+      if (add(text) < 0) goto done;
+      break;
+    case OP_SCAN_END:
+      /* close descriptors to scanner */
+      close(cfg.up_scan[R]);
+      close(cfg.dn_scan[W]);
+      cfg.up_scan[R] = -1;
+      cfg.dn_scan[W] = -1;
+
+      /* collect scanner sub process */
+      if (waitpid(cfg.scanner_pid, NULL, 0) < 0) {
+        fprintf(stderr, "wait: %s\n", strerror(errno));
+        goto done;
+      }
+      /* tell parent to tell db worker to purge OBE table entries */
+      if (push_purge_down(timestamp) < 0) goto done;
+
+      if (cfg.verbose) {
+        time_t now = time(NULL);
+        fprintf(stderr, "scanner: end (%lu sec)\n", now - timestamp);
+      }
+      break;
+    default:
+      fprintf(stderr, "scanner error: %s\n", text);
+      goto done;
+  }
+
+  rc = 0;
+
+ done:
+  if (tn) tpl_free(tn);
+  if (text) free(text);
+  return rc;
+}
+
 /* worker has sent us a message up the pipe */
 int handle_worker(void) {
   tpl_node *tn=NULL;
@@ -301,7 +382,7 @@ int handle_worker(void) {
 
   tn = tpl_map("isU", &op, &text, &tree_sz);
   if (tn == NULL) goto done;
-  if (tpl_load(tn, TPL_FD, cfg.up_pipe[R]) < 0) goto done;
+  if (tpl_load(tn, TPL_FD, cfg.up_work[R]) < 0) goto done;
   tpl_unpack(tn, 0);
 
   switch(op) {
@@ -415,14 +496,14 @@ int parse_sz(char *sz) {
 }
 
 int keep_parent(char *name, char *ppath) {
-  char tmp[FF_PATH_MAX], *p;
+  char tmp[PATH_MAX], *p;
   struct dirent *dent;
   int rc = -1, i=0;
   DIR *d = NULL;
   size_t l, rl;
 
   l = strlen(name);
-  if (l+1 > FF_PATH_MAX) {
+  if (l+1 > PATH_MAX) {
     fprintf(stderr, "path too long: %s\n", name);
     goto done;
   }
@@ -439,7 +520,7 @@ int keep_parent(char *name, char *ppath) {
 
   /* store back into caller buffer */
   rl = strlen(cfg.tmp);
-  if (rl+1 > FF_PATH_MAX) {
+  if (rl+1 > PATH_MAX) {
     fprintf(stderr, "path too long: %s\n", cfg.tmp);
     goto done;
   }
@@ -474,7 +555,7 @@ int keep_parent(char *name, char *ppath) {
 }
 
 int unlink_path(char *name, int is_dir) {
-  char ppath[FF_PATH_MAX];
+  char ppath[PATH_MAX];
   int rc = -1, ec;
 
   if (cfg.verbose) fprintf(stderr, "unlinking %s\n", name);
@@ -518,7 +599,7 @@ int add(char *file) {
   }
 
   l = strlen(cfg.tmp);
-  if (l+1 > FF_PATH_MAX) {
+  if (l+1 > PATH_MAX) {
     fprintf(stderr, "path too long: %s\n", cfg.tmp);
     goto done;
   }
@@ -544,22 +625,46 @@ int add(char *file) {
   return rc;
 }
 
+/* when scanner encounters each file in the tree during its scan,
+ * it pushes the file name to its parent to insert/update/confirm
+ * that it is in the table of known files. if the table is empty
+ * or out of sync, the scan brings it into sync, when coupled with
+ * the purge of any in-table files that were not found in the scan.
+ */
+int s_push_up(int op, char *text, uint64_t timestamp){
+  int rc = -1, ec;
+  tpl_node *tn=NULL;
+
+  tn = tpl_map("isU", &op, &text, &timestamp);
+  if (tn == NULL) goto done;
+  tpl_pack(tn,0);
+  ec = tpl_dump(tn, TPL_FD, cfg.up_scan[W]);
+  if (ec < 0) goto done;
+
+  rc = 0;
+
+ done:
+  if (tn) tpl_free(tn);
+  return rc;
+}
+
 /* add directory to tree, recursively. 
+ * recursion depth bounded by fs depth
+ * runs in scanner process
  *
  * returns
  *   < 0 on error
  *   >= 0 the number of files+directories in dir
  */
-int add_dir(char *dir) {
+int s_add_dir(char *dir) {
   int rc = -1, ec, n=0, f;
-  char path[FF_PATH_MAX];
+  char path[PATH_MAX];
   struct dirent *dent;
   struct stat s;
   size_t l, el;
   DIR *d = NULL;
 
   l = strlen(dir);
-
   d = opendir(dir);
   if (d == NULL) {
     fprintf(stderr, "opendir %s: %s\n", dir, strerror(errno));
@@ -576,7 +681,7 @@ int add_dir(char *dir) {
 
     /* formulate path to dir entry */
     el = strlen(dent->d_name);
-    if (l+1+el+1 > FF_PATH_MAX) {
+    if (l+1+el+1 > PATH_MAX) {
       fprintf(stderr, "path too long: %s/%s\n", dir, dent->d_name);
       goto done;
     }
@@ -591,12 +696,10 @@ int add_dir(char *dir) {
       goto done;
     }
 
-    /* dir? add recursively. if it was empty, prune it */
-    if (S_ISDIR(s.st_mode))  {
-      f = add_dir(path);
+    if (S_ISDIR(s.st_mode))  { /* dir? recurse. if empty, prune. */
+      f = s_add_dir(path);
       if (f < 0) goto done;
       if (f == 0) {
-        fprintf(stderr, "pruning empty directory %s\n", path);
         ec = rmdir(path);
         if (ec < 0) {
           fprintf(stderr, "rmdir %s: %s\n", path, strerror(errno));
@@ -604,17 +707,14 @@ int add_dir(char *dir) {
         }
       }
       if (f > 0) n++;
-    }
-    else if (S_ISREG(s.st_mode)) { /* regular file */
-      if (add(path) < 0) goto done;
+    } else if (S_ISREG(s.st_mode)) { /* regular file */
+      if (s_push_up(OP_SCAN_ADD, path, 0) < 0) goto done;
       n++;
-    }
-    else {
-      /* we will never attrition a special file */
+    } else {  /* a special file; ignore it- don't touch */
       fprintf(stderr, "special file: %s\n", path);
-      n++;
+      n++;  /* prevent pruning of its parent */
     }
-
+    nanosleep(&cfg.scanner_pause,0); /* reduce impact of scan */
   }
 
   rc = 0;
@@ -625,8 +725,8 @@ int add_dir(char *dir) {
 }
 
 /* the heart of this program is here. we process one filename.
- * this means, the filename needs to be stat'd to deteremine its
- * size and modification time. then we store that, along with the
+ * this means, the filename needs to be stat'd to determine its
+ * size and modification time. store that, along with the
  * time we did the stat (that is, the current time).
  */
 int process(char *file, size_t len) {
@@ -654,7 +754,7 @@ int w_report_up(int op, const char *text, uint64_t sz) {
   tn = tpl_map("isU", &op, &text, &sz);
   if (tn == NULL) goto done;
   tpl_pack(tn, 0);
-  ec = tpl_dump(tn, TPL_FD, cfg.up_pipe[W]);
+  ec = tpl_dump(tn, TPL_FD, cfg.up_work[W]);
   if (ec < 0) goto done;
 
   rc = 0;
@@ -691,19 +791,25 @@ int w_query(sqlite3_stmt *ps_query) {
   sqlite3_int64 sz;
   const char *file;
 
-  w_report_up(OP_DEBUG_UP, "querying tree size", 0);
-
   if (w_reset(ps_query) < 0) goto done;
+  /* query the table. even if the table is empty, our query
+   * returns one row, due to  SUM() function, with sz==0. */
   sc = sqlite3_step(ps_query);
-  if(sc != SQLITE_ROW) {
+  if(sc != SQLITE_ROW) { 
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
     goto done;
   }
 
   sz = sqlite3_column_int64(ps_query, 0);
   file = sqlite3_column_text(ps_query, 1);
-  /* SUM() in query returns sz==0 if no rows */
-  if (w_report_up(OP_SIZE_UP, file, sz) < 0) goto done;
+
+  /* only propagate the oldest-file to parent if its changed */
+  if ((sz != cfg.lsz) || strcmp(file,cfg.lod)) {
+    if (w_report_up(OP_SIZE_UP, file, sz) < 0) goto done;
+    if (strlen(file)+1 > sizeof(cfg.lod)) goto done;
+    strcpy(cfg.lod , file);
+    cfg.lsz = sz;
+  }
   
   rc = 0;
 
@@ -753,9 +859,6 @@ int w_delete(sqlite3_stmt *ps_delete, char *name) {
   }
 
   /* execute sql */
-  w_report_up(OP_DEBUG_UP, "executing delete:", 0);
-  w_report_up(OP_DEBUG_UP, name, 0);
-
   sc = sqlite3_step(ps_delete);
   if(sc != SQLITE_DONE) {
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
@@ -801,9 +904,6 @@ int w_insert(sqlite3_stmt *ps_insert, char *name, uint64_t sz,
   }
 
   /* execute sql */
-  w_report_up(OP_DEBUG_UP, "executing insert:", 0);
-  w_report_up(OP_DEBUG_UP, name, 0);
-
   sc = sqlite3_step(ps_insert);
   if (sc != SQLITE_DONE) {
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
@@ -881,7 +981,6 @@ int w_prepare_db(sqlite3 **db, sqlite3_stmt **ps_insert,
   int rc = -1, sc;
   char *sql;
 
-  w_report_up(OP_DEBUG_UP, "opening database", 0);
   sc = sqlite3_open(cfg.db_name, db);
   if(sc){
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
@@ -934,6 +1033,30 @@ int w_prepare_db(sqlite3 **db, sqlite3_stmt **ps_insert,
   return rc;
 }
 
+/* scanner process runs this function, never returns! */
+void scanner(void) {
+  char *img;
+  size_t nr;
+  int rc = -1;
+  time_t start_ts;
+
+  /* this is a background process- lower scheduling priority */
+  nice(10);
+
+  /* scan the directory tree, recursing over all files in it.
+   * each file gets added/updated in the table. afterward the 
+   * parent culls any table entries older than our start_time. 
+   * this cleans up file references that no longer exist in fs
+   */
+  start_ts = time(NULL);
+  if (s_add_dir(cfg.dir) < 0) goto done;
+  s_push_up(OP_SCAN_END, NULL, start_ts);
+
+  rc = 0;
+
+ done:
+  exit(rc);
+}
 /* worker process runs this function, never returns! */
 void worker(void) {
   sqlite3 *db=NULL;
@@ -957,7 +1080,7 @@ void worker(void) {
     if (w_query(ps_query) < 0) goto done;
 
     /* block waiting for parent instruction */
-    sc = tpl_gather(TPL_GATHER_BLOCKING, cfg.down_pipe[R], &img, &nr);
+    sc = tpl_gather(TPL_GATHER_BLOCKING, cfg.dn_work[R], &img, &nr);
 
     if (sc == 0) goto done; /* eof expected on parent exit */
     if (sc < 0) {
@@ -982,16 +1105,17 @@ void worker(void) {
   exit(-1);
 }
 
-int start_worker(void) {
+/* start process that scans file tree */
+int start_scanner(void) {
   int rc = -1, sc;
 
-  sc = pipe(cfg.down_pipe);
+  sc = pipe(cfg.dn_scan);
   if (sc < 0) {
     fprintf(stderr,"pipe: %s\n", strerror(errno));
     goto done;
   }
 
-  sc = pipe(cfg.up_pipe);
+  sc = pipe(cfg.up_scan);
   if (sc < 0) {
     fprintf(stderr,"pipe: %s\n", strerror(errno));
     goto done;
@@ -1004,8 +1128,54 @@ int start_worker(void) {
   } 
   
   if (sc == 0) { /* child */ 
-    close(cfg.down_pipe[W]);
-    close(cfg.up_pipe[R]);
+    close(cfg.dn_work[W]);
+    close(cfg.up_work[R]);
+    close(cfg.dn_scan[W]);
+    close(cfg.up_scan[R]);
+    prctl(PR_SET_NAME, "fprune-fs");
+    scanner();
+    /* not reached */
+    assert(0);
+  }
+
+  /* parent */
+  cfg.scanner_pid = sc;
+  close(cfg.dn_scan[R]);
+  close(cfg.up_scan[W]);
+  cfg.dn_scan[R] = -1;
+  cfg.up_scan[W] = -1;
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
+/* start process that works db */
+int start_worker(void) {
+  int rc = -1, sc;
+
+  sc = pipe(cfg.dn_work);
+  if (sc < 0) {
+    fprintf(stderr,"pipe: %s\n", strerror(errno));
+    goto done;
+  }
+
+  sc = pipe(cfg.up_work);
+  if (sc < 0) {
+    fprintf(stderr,"pipe: %s\n", strerror(errno));
+    goto done;
+  }
+
+  sc = fork();
+  if (sc < 0) {
+    fprintf(stderr,"fork: %s\n", strerror(errno));
+    goto done;
+  } 
+  
+  if (sc == 0) { /* child */ 
+    close(cfg.dn_work[W]);
+    close(cfg.up_work[R]);
     prctl(PR_SET_NAME, "fprune-db");
     worker();
     /* not reached */
@@ -1013,10 +1183,11 @@ int start_worker(void) {
   }
 
   /* parent */
-  close(cfg.down_pipe[R]);
-  close(cfg.up_pipe[W]);
-  cfg.down_pipe[R] = -1;
-  cfg.up_pipe[W] = -1;
+  cfg.worker_pid = sc;
+  close(cfg.dn_work[R]);
+  close(cfg.up_work[W]);
+  cfg.dn_work[R] = -1;
+  cfg.up_work[W] = -1;
 
   rc = 0;
 
@@ -1053,8 +1224,9 @@ int main(int argc, char *argv[]) {
     goto done;
   }
 
-  /* start the worker here. it has its own event loop */
+  /* start the db worker and the scanner */
   if (start_worker() < 0) goto done;
+  if (start_scanner() < 0) goto done;
 
   /* open the ring */
   cfg.ring = shr_open(cfg.ring_name, SHR_RDONLY|SHR_NONBLOCK);
@@ -1088,7 +1260,8 @@ int main(int argc, char *argv[]) {
 
   /* add descriptors of interest to epoll */
   if (add_epoll(EPOLLIN, cfg.signal_fd)) goto done;
-  if (add_epoll(EPOLLIN, cfg.up_pipe[R])) goto done;
+  if (add_epoll(EPOLLIN, cfg.up_work[R])) goto done;
+  if (add_epoll(EPOLLIN, cfg.up_scan[R])) goto done;
   if (add_epoll(EPOLLIN, cfg.ring_fd)) goto done;
 
   alarm(1);
@@ -1100,11 +1273,12 @@ int main(int argc, char *argv[]) {
       goto done;
     }
 
-    if (ec == 0)                          { assert(0); goto done; }
-    else if (ev.data.fd == cfg.signal_fd) { if (handle_signal()  < 0) goto done; }
-    else if (ev.data.fd == cfg.ring_fd)   { if (handle_io() < 0) goto done; }
-    else if (ev.data.fd == cfg.up_pipe[R]){ if (handle_worker() < 0) goto done; }
-    else                                  { assert(0); goto done; }
+    if (ec == 0)                          { assert(0); goto done;}
+    else if (ev.data.fd == cfg.signal_fd) { if (handle_signal()  < 0) goto done;}
+    else if (ev.data.fd == cfg.ring_fd)   { if (handle_io() < 0) goto done;}
+    else if (ev.data.fd == cfg.up_work[R]){ if (handle_worker() < 0) goto done;}
+    else if (ev.data.fd == cfg.up_scan[R]){ if (handle_scanner() < 0) goto done;}
+    else                                  { assert(0); goto done;}
 
     if (maintain() < 0) goto done;
   }
@@ -1116,9 +1290,13 @@ int main(int argc, char *argv[]) {
   if (cfg.signal_fd != -1) close(cfg.signal_fd);
   if (cfg.epoll_fd != -1) close(cfg.epoll_fd);
   if (cfg.ring_name) free(cfg.ring_name);
-  if (cfg.down_pipe[R] != -1) close(cfg.down_pipe[R]);
-  if (cfg.down_pipe[W] != -1) close(cfg.down_pipe[W]);
-  if (cfg.up_pipe[R] != -1) close(cfg.up_pipe[R]);
-  if (cfg.up_pipe[W] != -1) close(cfg.up_pipe[W]);
+  if (cfg.dn_work[R] != -1) close(cfg.dn_work[R]);
+  if (cfg.dn_work[W] != -1) close(cfg.dn_work[W]);
+  if (cfg.up_work[R] != -1) close(cfg.up_work[R]);
+  if (cfg.up_work[W] != -1) close(cfg.up_work[W]);
+  if (cfg.dn_scan[R] != -1) close(cfg.dn_scan[R]);
+  if (cfg.dn_scan[W] != -1) close(cfg.dn_scan[W]);
+  if (cfg.up_scan[R] != -1) close(cfg.up_scan[R]);
+  if (cfg.up_scan[W] != -1) close(cfg.up_scan[W]);
   return 0;
 }
