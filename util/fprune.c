@@ -792,24 +792,26 @@ int w_query(sqlite3_stmt *ps_query) {
   const char *file;
 
   if (w_reset(ps_query) < 0) goto done;
-  /* query the table. even if the table is empty, our query
-   * returns one row, due to  SUM() function, with sz==0. */
+
+  /* query the table. due to  SUM() function in our query,
+   * an empty table returns one row, with sz==0 and file==NULL */
   sc = sqlite3_step(ps_query);
   if(sc != SQLITE_ROW) { 
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
     goto done;
   }
-
   sz = sqlite3_column_int64(ps_query, 0);
   file = sqlite3_column_text(ps_query, 1);
 
   /* only propagate the oldest-file to parent if its changed */
-  if ((sz != cfg.lsz) || strcmp(file,cfg.lod)) {
+  if (file && ((sz != cfg.lsz) || strcmp(file,cfg.lod))) {
     if (w_report_up(OP_SIZE_UP, file, sz) < 0) goto done;
     if (strlen(file)+1 > sizeof(cfg.lod)) goto done;
     strcpy(cfg.lod , file);
     cfg.lsz = sz;
   }
+
+  if (file == NULL) { *cfg.lod = '\0'; cfg.lsz = 0;}
   
   rc = 0;
 
@@ -1216,13 +1218,14 @@ int main(int argc, char *argv[]) {
 
   if (dir == NULL) usage();
   if (cfg.ring_name == NULL) usage();
-  if ((sz == NULL) || (parse_sz(sz) < 0)) usage();
 
   /* form absolute realpath of dir to monitor */
   if (realpath(dir, cfg.dir) == NULL) {
     fprintf(stderr, "realpath %s: %s\n", dir, strerror(errno));
     goto done;
   }
+  /* parse size here; it relies on cfg.dir being set for % mode */
+  if ((sz == NULL) || (parse_sz(sz) < 0)) usage();
 
   /* start the db worker and the scanner */
   if (start_worker() < 0) goto done;
