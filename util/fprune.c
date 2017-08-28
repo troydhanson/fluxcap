@@ -913,6 +913,13 @@ int w_prepare_db(sqlite3 **db, sqlite3_stmt **ps_insert,
     goto done;
   }
 
+  /* set 10 sec timeout for getting table lock */
+  sc = sqlite3_busy_timeout(*db, 10000);
+  if (sc != SQLITE_OK) {
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
+    goto done;
+  }
+
   /* establish database table if need be */
   sql = "CREATE TABLE IF NOT EXISTS files ("
         "name TEXT PRIMARY KEY, "
