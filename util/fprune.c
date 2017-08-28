@@ -833,8 +833,6 @@ int w_purge(sqlite3_stmt *ps_purge, uint64_t stattime) {
   }
 
   /* execute sql */
-  w_report_up(OP_DEBUG_UP, "executing purge", 0);
-
   sc = sqlite3_step(ps_purge);
   if(sc != SQLITE_DONE) {
     w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
@@ -996,6 +994,10 @@ int w_prepare_db(sqlite3 **db, sqlite3_stmt **ps_insert,
         "modts INTEGER, "
         "statts INTEGER "
         ");";
+  if (w_exec_sql(*db, sql) < 0) goto done;
+
+  /* index so it's quick to find the min timestamp */
+  sql = "CREATE INDEX byage ON files(modts);";
   if (w_exec_sql(*db, sql) < 0) goto done;
 
   /* prepared statements */

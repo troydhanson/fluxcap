@@ -32,6 +32,9 @@
  * writes output filename to secondary ring optionally
  */
 
+/* if file queue exceeds thresh, gzip is toggled off */
+#define GZIP_TOGGLE_THRESH 10
+
 #define BATCH_FRAMES 10000
 #define BATCH_MB     10
 #define BATCH_BYTES  (BATCH_MB * 1024 * 1024)
@@ -56,6 +59,7 @@ struct {
   char *regex;    /* regex applied to input filenames */
   char *template;   /* basis of output filenames */
   pcre *re;         /* compiled regex */
+  int last_qlen;    /* last queue length from shr buffer */
   /* these are all work spaces for dealing with paths */
   char tmp[PATH_MAX];
   char dir[PATH_MAX];
@@ -91,11 +95,13 @@ void usage() {
                  "   -t <template>      [default: basename of original]\n"
                  "   -o <output-ring>   [log output filenames to ring]\n"
                  "   -m                 [create directories in output path]\n"
-                 "   -z                 [gzip the output file]\n"
+                 "   -z                 [gzip the output file, appends .gz]\n"
                  "   -d                 [dry-run; show names, no copying]\n"
                  "   -h                 [this help]\n"
                  "   -v                 [verbose; repeatable]\n"
                  "\n"
+                 "In -z (gzip) mode, compression is toggled off temporarily\n"
+                 "whenever the compression backlog exceeds 10 files.\n"
                  "\n"
                  "\n");
   exit(-1);
@@ -164,15 +170,23 @@ int handle_signal(void) {
 #define def_windowbits (15 + want_gzip)
 #define def_memlevel 8
 int zip_copy(char *file, char *dest) {
+  char suffixed_path[PATH_MAX];
   int fd=-1,dd=-1,rc=-1,ec;
   char *src=NULL,*dst=NULL;
   struct stat s;
-  size_t zmax;
+  size_t zmax, len;
 
   if (cfg.dry_run) {
     rc = 0;
     goto done;
   }
+
+  /* add the .gz extension */
+  len = strlen(dest);
+  if (len+1+3 > sizeof(suffixed_path)) goto done;
+  memcmp(suffixed_path, dest, len);
+  memcmp(suffixed_path+len, ".gz", 4);
+  dest = suffixed_path;
 
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
@@ -508,7 +522,8 @@ int process(char *file, size_t len) {
   if (pat2path(cfg.tmp, ovec, pe) < 0) goto done;
   if (cfg.mkpath && (mkpath(cfg.opath) < 0)) goto done;
 
-  ec = cfg.gzip ? zip_copy(cfg.tmp, cfg.opath) : 
+  ec = (cfg.gzip && (cfg.last_qlen < GZIP_TOGGLE_THRESH)) ? 
+                  zip_copy(cfg.tmp, cfg.opath) : 
                   map_copy(cfg.tmp, cfg.opath);
   if (ec < 0) goto done;
 
@@ -535,6 +550,10 @@ int handle_io(void) {
   rv = shr_readv(cfg.ring, cfg.buf, BATCH_BYTES, cfg.iov, &iovcnt);
   if (rv < 0) fprintf(stderr, "shr_readv: error\n");
   if (rv > 0) {
+
+    /* track the last queue length, to implement -Z auto toggle */
+    cfg.last_qlen = iovcnt;
+
     /* iterate over filenames read in batch */
     for(i = 0; i < iovcnt; i++) {
       iov = &cfg.iov[i];
