@@ -49,11 +49,8 @@ struct iovec read_iov[BATCH_FRAMES];
 #define W 1
 
 /* codes used in comms between parent and worker */
-#define OP_DELETE   1
 #define OP_INSERT   2
 #define OP_PURGE    3
-#define OP_SIZE_UP  4
-#define OP_LOG_UP   5
 #define OP_ERR_UP   6
 #define OP_DEBUG_UP 7
 #define OP_SCAN_ADD 8
@@ -67,17 +64,14 @@ struct {
   int ring_fd;      /* ring readability fd */
   char *ring_name;  /* ring file name */
   struct shr *ring; /* open ring handle */
+  size_t ring_def_sz; /* ring buffer size if not extant */
   char *buf;        /* buf for shr_readv */
   struct iovec *iov;/* iov for shr_readv */
-  size_t tree_sz;   /* byte size of tree */
   size_t max;       /* byte size to prune to */
   char *db_name;    /* db file */
   char dir[PATH_MAX]; /* tree to prune (realpath) */
-  char old[PATH_MAX]; /* oldest file, next to attrition */
   char cur[PATH_MAX]; /* current file when reading ring */
   char tmp[PATH_MAX]; /* temp in add and unlink_path */
-  char lod[PATH_MAX]; /* last-old file, to avoid repeating */
-  uint64_t lsz;       /* last-old file sz */
   int dn_work[2];   /* pipe for parent-to-worker comms */
   int up_work[2];   /* pipe for worker-to-parent comms */
   int dn_scan[2];   /* pipe for parent-to-scanner */
@@ -97,7 +91,8 @@ struct {
   .up_work = {-1,-1},
   .dn_scan = {-1,-1},
   .up_scan = {-1,-1},
-  .scanner_pause = {.tv_nsec= 10000000}, /* 1/100th second */
+  .scanner_pause = {.tv_nsec= 1000000}, /* 1/1000th second */
+  .ring_def_sz = 1024*1024, /* 1mb */
 };
 
 /* signals that we'll accept via signalfd in epoll */
@@ -111,11 +106,14 @@ void usage() {
                  "size specified in the -s argument. It attritions files,\n"
                  "by age, and deletes subdirectories once they are empty.\n"
                  "\n"
-                 "An initial scan of the directory is done at start up time.\n"
                  "Thereafter, this daemon must be told about files coming in\n"
                  "to the directory tree, from a compatible application (e.g.\n"
                  "ffcp) that writes the filenames into the ring buffer.\n"
-                 "The ring buffer itself can be created using shr-tool.\n"
+                 "\n"
+                 "A background scan of the directory is done at start up.\n"
+                 "This brings the internal state into consistency with the"
+                 "directory tree. Restart this daemon to induce this re-\n"
+                 "scan whenever extraneous changes to the tree are made.\n"
                  "\n"
                  "\n");
   fprintf(stderr,"usage: %s [options] -s <sz> -r <ring> -d <dir>\n", cfg.prog);
@@ -163,19 +161,19 @@ int w_exec_sql(sqlite3 *db, char *sql) {
 
   sc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
   if( sc!=SQLITE_OK ){
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sc = sqlite3_step(stmt);
   if(sc != SQLITE_DONE) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sc = sqlite3_finalize(stmt);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
@@ -192,28 +190,6 @@ int push_purge_down(uint64_t scan_start_ts) {
 
   op = OP_PURGE;
   tn = tpl_map("iU", &op, &scan_start_ts);
-  if (tn == NULL) goto done;
-  tpl_pack(tn, 0);
-  ec = tpl_dump(tn, TPL_FD, cfg.dn_work[W]);
-  if (ec < 0) {
-    fprintf(stderr,"tpl_dump: error %d\n", ec);
-    goto done;
-  }
-
-  rc = 0;
-
- done:
-  if (tn) tpl_free(tn);
-  return rc;
-}
-
-/* push unlink of file down to worker */
-int push_unlink_down(char *name) {
-  int rc = -1, op, ec;
-  tpl_node *tn=NULL;
-
-  op = OP_DELETE;
-  tn = tpl_map("is", &op, &name);
   if (tn == NULL) goto done;
   tpl_pack(tn, 0);
   ec = tpl_dump(tn, TPL_FD, cfg.dn_work[W]);
@@ -293,35 +269,6 @@ int handle_signal(void) {
   return rc;
 }
 
-/* maintain the tree size by deleting the oldest file if needed.
- * when we do that, we notify the worker we did so; it removes
- * it from its list of files in the tree. then it sends us the
- * next oldest file. i.e. each push_unlink_down induces a message from
- * the worker, causing another round of handle_worker/maintain
- */
-int maintain(void) {
-  int rc = -1;
-
-  if (cfg.tree_sz > cfg.max) {
-
-    /* delete oldest file; pruning empty dirs upward in tree */
-    assert(*cfg.old);
-    if (unlink_path(cfg.old, 0) < 0) goto done;
-
-    /* tell worker we unlinked it */
-    if (push_unlink_down(cfg.old) < 0) goto done;
-
-    /* invalidate sz since we deleted it */
-    cfg.tree_sz = 0;
-    *cfg.old = '\0';
-  }
-
-  rc = 0;
-
- done:
-  return rc;
-}
-
 /* scanner has sent us a message up the pipe */
 int handle_scanner(void) {
   tpl_node *tn=NULL;
@@ -376,11 +323,10 @@ int handle_scanner(void) {
 int handle_worker(void) {
   tpl_node *tn=NULL;
   char *text = NULL;
-  uint64_t tree_sz;
   int rc = -1, op;
   size_t len;
 
-  tn = tpl_map("isU", &op, &text, &tree_sz);
+  tn = tpl_map("is", &op, &text);
   if (tn == NULL) goto done;
   if (tpl_load(tn, TPL_FD, cfg.up_work[R]) < 0) goto done;
   tpl_unpack(tn, 0);
@@ -390,22 +336,8 @@ int handle_worker(void) {
       fprintf(stderr, "worker error: %s\n", text);
       goto done;
       break;
-    case OP_LOG_UP:
-      fprintf(stderr, "worker: %s\n", text);
-      break;
     case OP_DEBUG_UP:
       if (cfg.verbose) fprintf(stderr, "worker: %s\n", text);
-      break;
-    case OP_SIZE_UP:
-      /* size is reported as 0 with text==NULL when no files */
-      len = text ? strlen(text) : 0;
-      if (len > sizeof(cfg.old)) {
-        fprintf(stderr,"filename too long\n");
-        goto done;
-      }
-      if (len) memcpy(cfg.old, text, len+1);
-      else *cfg.old = '\0';
-      cfg.tree_sz = tree_sz;
       break;
     default:
       fprintf(stderr, "invalid op %d from worker\n", op);
@@ -495,7 +427,7 @@ int parse_sz(char *sz) {
   return rc;
 }
 
-int keep_parent(char *name, char *ppath) {
+int w_keep_parent(const char *name, char *ppath) {
   char tmp[PATH_MAX], *p;
   struct dirent *dent;
   int rc = -1, i=0;
@@ -554,7 +486,7 @@ int keep_parent(char *name, char *ppath) {
   return rc ? -1 : i;
 }
 
-int unlink_path(char *name, int is_dir) {
+int w_unlink_path(const char *name, int is_dir) {
   char ppath[PATH_MAX];
   int rc = -1, ec;
 
@@ -568,10 +500,10 @@ int unlink_path(char *name, int is_dir) {
   }
 
   /* attrition empty parent directories, up to cfg.dir */
-  ec = keep_parent(name, ppath);
+  ec = w_keep_parent(name, ppath);
   if (ec < 0) goto done;
   else if (ec > 0) { /* keep */ }
-  else if (unlink_path(ppath, 1) < 0) goto done;
+  else if (w_unlink_path(ppath, 1) < 0) goto done;
 
   rc = 0;
 
@@ -588,6 +520,7 @@ int add(char *file) {
   /* canonicalize to an absolute path. only abs paths in db */
   if (realpath(file, cfg.tmp) == NULL) {
     fprintf(stderr, "realpath %s: %s\n", file, strerror(errno));
+    if (errno == ENOENT) rc = 0; /* skip missing file; continue on */
     goto done;
   }
 
@@ -746,12 +679,11 @@ int process(char *file, size_t len) {
   return rc;
 }
 
-/* report oldest file in tree, and tree sz to parent (runs in worker) */
-int w_report_up(int op, const char *text, uint64_t sz) {
+int w_report_up(int op, const char *text) {
   tpl_node *tn=NULL;
   int rc = -1, ec;
 
-  tn = tpl_map("isU", &op, &text, &sz);
+  tn = tpl_map("is", &op, &text);
   if (tn == NULL) goto done;
   tpl_pack(tn, 0);
   ec = tpl_dump(tn, TPL_FD, cfg.up_work[W]);
@@ -769,13 +701,13 @@ int w_reset(sqlite3_stmt *ps) {
 
   sc = sqlite3_reset(ps);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sc = sqlite3_clear_bindings(ps);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
@@ -785,34 +717,63 @@ int w_reset(sqlite3_stmt *ps) {
   return rc;
 }
 
-/* query tree size from db. runs in worker. report to parent */
-int w_query(sqlite3_stmt *ps_query) {
+/* query tree size from db. runs in worker. */
+int w_maintain(sqlite3_stmt *ps_query, sqlite3_stmt *ps_delete) {
   int sc, rc = -1;
-  sqlite3_int64 sz;
-  const char *file;
+  sqlite3_int64 tree_sz, file_sz;
+  const char *f;
+  char file[PATH_MAX];
+  size_t flen;
 
-  if (w_reset(ps_query) < 0) goto done;
+  do {
+    /* query the table. due to SUM function in our query, even
+     * an empty table returns one row, with sz==0 and f==NULL */
+    if (w_reset(ps_query) < 0) goto done;
+    sc = sqlite3_step(ps_query);
+    if(sc != SQLITE_ROW) { 
+      w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
+      goto done;
+    }
+    tree_sz = sqlite3_column_int64(ps_query, 0);
+    f = sqlite3_column_text(ps_query, 1);
+    /* MIN(modts) is index 2 */
+    file_sz = sqlite3_column_int64(ps_query, 3);
 
-  /* query the table. due to  SUM() function in our query,
-   * an empty table returns one row, with sz==0 and file==NULL */
-  sc = sqlite3_step(ps_query);
-  if(sc != SQLITE_ROW) { 
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
-    goto done;
-  }
-  sz = sqlite3_column_int64(ps_query, 0);
-  file = sqlite3_column_text(ps_query, 1);
+    /* copy filename from sqlite3's transient buffer */
+    *file = '\0';
+    flen = f ? strlen(f) : 0;
+    if (flen+1 > sizeof(file)) goto done;
+    if (f) memcpy(file, f, flen+1);
+    
+    /* allow query to complete so db unlocks/frees row space */
+    sc = sqlite3_step(ps_query);
+    if(sc != SQLITE_DONE) { 
+      w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
+      goto done;
+    }
 
-  /* only propagate the oldest-file to parent if its changed */
-  if (file && ((sz != cfg.lsz) || strcmp(file,cfg.lod))) {
-    if (w_report_up(OP_SIZE_UP, file, sz) < 0) goto done;
-    if (strlen(file)+1 > sizeof(cfg.lod)) goto done;
-    strcpy(cfg.lod , file);
-    cfg.lsz = sz;
-  }
+    if (tree_sz > cfg.max) {
+      if (w_unlink_path(file, 0) < 0) goto done;
+      assert(tree_sz >= file_sz);
+      tree_sz -= file_sz;
 
-  if (file == NULL) { *cfg.lod = '\0'; cfg.lsz = 0;}
-  
+      /* delete entry from db */
+      if (cfg.verbose > 1) fprintf(stderr,"w_maintain: delete %s\n", file);
+      if (w_reset(ps_delete) < 0) goto done;
+      sc = sqlite3_bind_text(ps_delete, 1, file, -1, SQLITE_TRANSIENT);
+      if (sc != SQLITE_OK) {
+        w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
+        goto done;
+      }
+      sc = sqlite3_step(ps_delete);
+      if(sc != SQLITE_DONE) {
+        w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
+        goto done;
+      }
+    }
+
+  } while (tree_sz > cfg.max);
+
   rc = 0;
 
  done:
@@ -828,42 +789,17 @@ int w_purge(sqlite3_stmt *ps_purge, uint64_t stattime) {
   /* bind values */
   sc = sqlite3_bind_int64(ps_purge, 1, stattime);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   /* execute sql */
   sc = sqlite3_step(ps_purge);
   if(sc != SQLITE_DONE) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
-
-  rc = 0;
-
- done:
-  return rc;
-}
-/* delete row in the db. runs in worker */
-int w_delete(sqlite3_stmt *ps_delete, char *name) {
-  int sc, rc = -1;
-
-  if (w_reset(ps_delete) < 0) goto done;
-
-  /* bind values */
-  sc = sqlite3_bind_text(ps_delete, 1, name, -1, SQLITE_TRANSIENT);
-  if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
-    goto done;
-  }
-
-  /* execute sql */
-  sc = sqlite3_step(ps_delete);
-  if(sc != SQLITE_DONE) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
-    goto done;
-  }
 
   rc = 0;
 
@@ -881,32 +817,32 @@ int w_insert(sqlite3_stmt *ps_insert, char *name, uint64_t sz,
   /* bind values */
   sc = sqlite3_bind_text(ps_insert, 1, name, -1, SQLITE_TRANSIENT);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sc = sqlite3_bind_int64( ps_insert, 2, sz);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sc = sqlite3_bind_int64( ps_insert, 3, mtime);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sc = sqlite3_bind_int64( ps_insert, 4, stattime);
   if (sc != SQLITE_OK) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   /* execute sql */
   sc = sqlite3_step(ps_insert);
   if (sc != SQLITE_DONE) {
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
@@ -917,8 +853,6 @@ int w_insert(sqlite3_stmt *ps_insert, char *name, uint64_t sz,
 }
 /* decode opcode from parent. runs in worker */
 int w_decode_op(char *img, size_t sz, sqlite3_stmt *ps_insert, 
-                                      sqlite3_stmt *ps_delete, 
-                                      sqlite3_stmt *ps_query,
                                       sqlite3_stmt *ps_purge) {
   int rc = -1, ec, op;
   tpl_node *tn=NULL;
@@ -927,19 +861,11 @@ int w_decode_op(char *img, size_t sz, sqlite3_stmt *ps_insert,
 
   fmt = tpl_peek(TPL_MEM | TPL_DATAPEEK, img, sz, "i", &op);
   if (fmt == NULL) {
-    w_report_up(OP_ERR_UP, "tpl_peek: decoding error\n", 0);
+    w_report_up(OP_ERR_UP, "tpl_peek: decoding error\n");
     goto done;
   }
 
   switch(op) {
-    case OP_DELETE: 
-      if ( (tn = tpl_map("is", &op, &name)) == NULL) goto done;
-      if (tpl_load(tn, TPL_MEM, img, sz) < 0) goto done;
-      tpl_unpack(tn, 0);
-      if (w_delete(ps_delete, name) < 0) {
-        goto done;
-      }
-      break;
     case OP_INSERT:
       tn = tpl_map("isUUU", &op, &name, &file_sz, &file_mtime, &file_stattime);
       if (tn == NULL) goto done;
@@ -959,7 +885,7 @@ int w_decode_op(char *img, size_t sz, sqlite3_stmt *ps_insert,
       }
       break;
     default: 
-      w_report_up(OP_ERR_UP, "decoding error: invalid op\n", 0);
+      w_report_up(OP_ERR_UP, "decoding error: invalid op\n");
       goto done;
       break;
   }
@@ -983,7 +909,7 @@ int w_prepare_db(sqlite3 **db, sqlite3_stmt **ps_insert,
 
   sc = sqlite3_open(cfg.db_name, db);
   if(sc){
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
@@ -997,37 +923,37 @@ int w_prepare_db(sqlite3 **db, sqlite3_stmt **ps_insert,
   if (w_exec_sql(*db, sql) < 0) goto done;
 
   /* index so it's quick to find the min timestamp */
-  sql = "CREATE INDEX byage ON files(modts);";
+  sql = "CREATE INDEX IF NOT EXISTS byage ON files(modts);";
   if (w_exec_sql(*db, sql) < 0) goto done;
 
   /* prepared statements */
   sql = "INSERT OR REPLACE INTO files VALUES ($name, $size, $modts, $statts);";
   sc = sqlite3_prepare_v2(*db, sql, -1, ps_insert, NULL);
   if(sc != SQLITE_OK ){
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sql = "DELETE FROM files WHERE name = $NAME;";
   sc = sqlite3_prepare_v2(*db, sql, -1, ps_delete, NULL);
   if(sc != SQLITE_OK ){
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   /* yields one row with the tree size summed over all rows, 
    * and filename of the oldest file, and its mod time. */
-  sql = "SELECT SUM(size), name, MIN(modts) FROM files;";
+  sql = "SELECT SUM(size), name, MIN(modts), size FROM files;";
   sc = sqlite3_prepare_v2(*db, sql, -1, ps_query, NULL);
   if(sc != SQLITE_OK ){
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
   sql = "DELETE FROM files WHERE statts < $STATTS;";
   sc = sqlite3_prepare_v2(*db, sql, -1, ps_purge, NULL);
   if(sc != SQLITE_OK ){
-    w_report_up(OP_ERR_UP, sqlite3_errstr(sc), 0);
+    w_report_up(OP_ERR_UP, sqlite3_errstr(sc));
     goto done;
   }
 
@@ -1075,26 +1001,25 @@ void worker(void) {
                *ps_purge=NULL;
 
   if (w_prepare_db(&db, &ps_insert, &ps_delete, &ps_query, &ps_purge) < 0) {
-    w_report_up(OP_ERR_UP, "db setup failed\n", 0);
+    w_report_up(OP_ERR_UP, "db setup failed\n");
     goto done;
   }
 
   while(1) {
-    /* tell parent how much size tree consumes */
-    if (w_query(ps_query) < 0) goto done;
+    if (w_maintain(ps_query, ps_delete) < 0) goto done;
 
     /* block waiting for parent instruction */
     sc = tpl_gather(TPL_GATHER_BLOCKING, cfg.dn_work[R], &img, &nr);
 
     if (sc == 0) goto done; /* eof expected on parent exit */
     if (sc < 0) {
-      w_report_up(OP_ERR_UP, "tpl_gather: error\n", 0);
+      w_report_up(OP_ERR_UP, "tpl_gather: error\n");
       goto done;
     }
 
     assert(sc > 0);
     assert(img);
-    if (w_decode_op(img, nr, ps_insert, ps_delete, ps_query, ps_purge) < 0) {
+    if (w_decode_op(img, nr, ps_insert, ps_purge) < 0) {
       goto done;
     }
     free(img);
@@ -1234,6 +1159,8 @@ int main(int argc, char *argv[]) {
   if (start_scanner() < 0) goto done;
 
   /* open the ring */
+  int init_mode = SHR_KEEPEXIST|SHR_MESSAGES|SHR_DROP;
+  if (shr_init(cfg.ring_name, cfg.ring_def_sz, init_mode) < 0) goto done;
   cfg.ring = shr_open(cfg.ring_name, SHR_RDONLY|SHR_NONBLOCK);
   if (cfg.ring == NULL) goto done;
   cfg.ring_fd = shr_get_selectable_fd(cfg.ring);
@@ -1285,7 +1212,6 @@ int main(int argc, char *argv[]) {
     else if (ev.data.fd == cfg.up_scan[R]){ if (handle_scanner() < 0) goto done;}
     else                                  { assert(0); goto done;}
 
-    if (maintain() < 0) goto done;
   }
   
   rc = 0;

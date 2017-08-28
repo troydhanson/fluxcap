@@ -181,16 +181,10 @@ int zip_copy(char *file, char *dest) {
     goto done;
   }
 
-  /* add the .gz extension */
-  len = strlen(dest);
-  if (len+1+3 > sizeof(suffixed_path)) goto done;
-  memcmp(suffixed_path, dest, len);
-  memcmp(suffixed_path+len, ".gz", 4);
-  dest = suffixed_path;
-
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
     fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
+    if (errno == ENOENT) rc = 1;
     goto done;
   }
   if (fstat(fd, &s) == -1) {
@@ -291,6 +285,7 @@ int map_copy(char *file, char *dest) {
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
     fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
+    if (errno == ENOENT) rc = 1;
     goto done;
   }
   if (fstat(fd, &s) == -1) {
@@ -355,6 +350,7 @@ int same_file(char *newfile, char *srcfile) {
 
   if (realpath(srcfile, cfg.rpath1) == NULL) {
     fprintf(stderr, "realpath: %s: %s\n", srcfile, strerror(errno));
+    if (errno == ENOENT) rc = 0; /* special case: caller skips missing files */
     goto done;
   }
 
@@ -522,12 +518,21 @@ int process(char *file, size_t len) {
   if (pat2path(cfg.tmp, ovec, pe) < 0) goto done;
   if (cfg.mkpath && (mkpath(cfg.opath) < 0)) goto done;
 
-  ec = (cfg.gzip && (cfg.last_qlen < GZIP_TOGGLE_THRESH)) ? 
-                  zip_copy(cfg.tmp, cfg.opath) : 
-                  map_copy(cfg.tmp, cfg.opath);
-  if (ec < 0) goto done;
+  if (cfg.gzip && (cfg.last_qlen < GZIP_TOGGLE_THRESH)) {
+    /* add the .gz extension */
+    l = strlen(cfg.opath);
+    if (l+1+3 > sizeof(cfg.opath)) goto done;
+    memcpy(cfg.opath+l, ".gz", 4);
+    ec = zip_copy(cfg.tmp, cfg.opath);
+    if (ec < 0) goto done;
+  } else {
+    ec = map_copy(cfg.tmp, cfg.opath);
+    if (ec < 0) goto done;
+  }
 
-  if (cfg.oring) {
+  /* ec == 1 means the input file was missing, so copy was a no-op.
+   * if we performed a real copy, record that in the output ring */
+  if ((ec == 0) && cfg.oring) {
     ec = shr_write(cfg.oring, cfg.opath, strlen(cfg.opath));
     if (ec < 0) {
       fprintf(stderr, "shr_write: error (%d)\n", ec);
