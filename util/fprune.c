@@ -111,7 +111,7 @@ void usage() {
                  "ffcp) that writes the filenames into the ring buffer.\n"
                  "\n"
                  "A background scan of the directory is done at start up.\n"
-                 "This brings the internal state into consistency with the"
+                 "This brings the internal state into consistency with the\n"
                  "directory tree. Restart this daemon to induce this re-\n"
                  "scan whenever extraneous changes to the tree are made.\n"
                  "\n"
@@ -494,9 +494,14 @@ int w_unlink_path(const char *name, int is_dir) {
 
   /* do the unlink. tolerate a priori nonexistence */
   ec = is_dir ? rmdir(name) : unlink(name);
-  if ((ec < 0) && (errno != ENOENT)) {
-    fprintf(stderr, "unlink: %s: %s\n", name, strerror(errno));
-    goto done;
+  if (ec < 0) {
+    if (errno == ENOENT) {
+      rc = 0;
+      goto done;
+    } else {
+      fprintf(stderr, "unlink: %s: %s\n", name, strerror(errno));
+      goto done;
+    }
   }
 
   /* attrition empty parent directories, up to cfg.dir */

@@ -183,8 +183,8 @@ int zip_copy(char *file, char *dest) {
 
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
-    fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
     if (errno == ENOENT) rc = 1;
+    fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
     goto done;
   }
   if (fstat(fd, &s) == -1) {
@@ -284,8 +284,8 @@ int map_copy(char *file, char *dest) {
 
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
-    fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
     if (errno == ENOENT) rc = 1;
+    fprintf(stderr,"can't open %s: %s\n", file, strerror(errno));
     goto done;
   }
   if (fstat(fd, &s) == -1) {
@@ -349,8 +349,8 @@ int same_file(char *newfile, char *srcfile) {
   int rc = -1;
 
   if (realpath(srcfile, cfg.rpath1) == NULL) {
-    fprintf(stderr, "realpath: %s: %s\n", srcfile, strerror(errno));
     if (errno == ENOENT) rc = 0; /* special case: caller skips missing files */
+    fprintf(stderr, "realpath: %s: %s\n", srcfile, strerror(errno));
     goto done;
   }
 
