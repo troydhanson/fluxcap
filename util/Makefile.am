@@ -23,8 +23,11 @@ fluxtop_LDADD = -L../lib -lut -ltpl -lncurses -lshr
 endif
 
 if HAVE_SQLITE3
-bin_PROGRAMS += fprune
+bin_PROGRAMS += fprune ffpcap
 fprune_SOURCES = fprune.c
 fprune_CPPFLAGS = -I$(srcdir)/../lib/libut/include -I$(srcdir)/../lib/tpl/src
 fprune_LDADD = -L../lib -lut -lshr -ltpl -lsqlite3
+ffpcap_SOURCES = ffpcap.c
+ffpcap_CPPFLAGS =
+ffpcap_LDADD = -lshr -lsqlite3
 endif

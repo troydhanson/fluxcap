@@ -1,9 +1,11 @@
 #include <sys/signalfd.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 #include <sys/prctl.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/epoll.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -95,6 +97,10 @@ struct {
   .ring_def_sz = 1024*1024, /* 1mb */
 };
 
+int w_report_up(int op, const char *text);
+int add(char *file);
+int process(char *file, size_t len);
+
 /* signals that we'll accept via signalfd in epoll */
 int sigs[] = {SIGHUP,SIGTERM,SIGINT,SIGQUIT,SIGALRM};
 
@@ -120,7 +126,7 @@ void usage() {
   fprintf(stderr,"\n");
   fprintf(stderr,"options:\n"
                  "   -d <directory      [directory to prune; required]\n"
-                 "   -s <max-size>      [size to prune to, units k/m/g/t/%]\n"
+                 "   -s <max-size>      [size to prune to, units k/m/g/t/%%]\n"
                  "   -r <ring-file>     [name of ring of incoming files]\n"
                  "   -b                 [database file; def: fprune.db]\n"
                  "   -v                 [verbose; repeatable]\n"
@@ -983,7 +989,7 @@ void scanner(void) {
   time_t start_ts;
 
   /* this is a background process- lower scheduling priority */
-  nice(10);
+  setpriority(PRIO_PROCESS, 0, 10);
 
   /* scan the directory tree, recursing over all files in it.
    * each file gets added/updated in the table. afterward the 
