@@ -31,7 +31,7 @@
 struct {
   int verbose;
   char *prog;
-  enum {mode_build, mode_print, mode_flush} mode;
+  enum {mode_build, mode_print, mode_output} mode;
 
   /* file structure to index */
   char dir[PATH_MAX];
@@ -67,21 +67,18 @@ struct {
 };
 
 void usage() {
-  fprintf(stderr, "usage: %s [options] -b <dbfile>\n", CF.prog);
+  fprintf(stderr, "usage: %s [options] -b <dbfile> [<pcap> ...]\n", CF.prog);
   fprintf(stderr, "\n");
-  fprintf(stderr, "build mode (default):\n");
-  fprintf(stderr, "   -d <dir>      (directory root to scan)\n");
+  fprintf(stderr, "   -d <dir>      (directory to scan for files)\n");
   fprintf(stderr, "   -r [0|1]      (scan recursively; default: 1)\n");
-  fprintf(stderr, "   -t [0|1]      (truncate db; default: 1)\n");
   fprintf(stderr, "   -s <suffix>   (only files matching suffix)\n");
+  fprintf(stderr, "   -O            (output only, skip build phase\n");
+  fprintf(stderr, "   -o <ring>     (output sorted packets to ring)\n");
+  fprintf(stderr, "   -u <a:b>      (output packets in epoch usec range)\n");
+  fprintf(stderr, "   -H [0:1]      (output header on packets; def: 0)\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "print mode:\n");
   fprintf(stderr, "   -p            (print db)\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "ring flush mode:\n");
-  fprintf(stderr, "   -o <ring>     (output packet ring)\n");
-  fprintf(stderr, "   -u <from:to>  (time range; epoch usec)\n");
-  fprintf(stderr, "   -H [0:1]      (copy packet hdr; default: 0)\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "general options:\n");
   fprintf(stderr, "   -v            (verbose, repeatable)\n");
@@ -662,7 +659,7 @@ int main(int argc, char *argv[]) {
 
   CF.prog = argv[0];
 
-  while ( (opt = getopt(argc,argv,"vphd:r:t:s:b:u:o:H:")) > 0) {
+  while ( (opt = getopt(argc,argv,"vphd:r:t:s:b:u:o:OH:")) > 0) {
     switch(opt) {
       case 'v': CF.verbose++; break;
       case 'd': dir = strdup(optarg); break;
@@ -672,7 +669,8 @@ int main(int argc, char *argv[]) {
       case 'p': CF.mode = mode_print; break;
       case 's': CF.suffix = strdup(optarg); break;
       case 'b': CF.db_name = strdup(optarg); break;
-      case 'o': CF.ring_name = strdup(optarg); CF.mode = mode_flush; break;
+      case 'o': CF.ring_name = strdup(optarg); break;
+      case 'O': CF.mode = mode_output; break;
       case 'u': CF.time_range = strdup(optarg); break;
       case 'h': default: usage(argv[0]); break;
     }
@@ -689,15 +687,17 @@ int main(int argc, char *argv[]) {
        goto done;
      }
      if (add_dir(CF.dir) < 0) goto done;
-     break;
-    case mode_print:
-     if (print_db() < 0) goto done;
-     break;
-    case mode_flush:
+     while ((optind < argc) && (add_file(argv[optind++]) < 0)) goto done;
+     if (CF.ring_name == NULL) break;
+     else { /* FALL THRU */ }
+    case mode_output:
      if (CF.ring_name == NULL) usage();
      CF.ring = shr_open(CF.ring_name, SHR_WRONLY);
      if (CF.ring == NULL) goto done;
      if (populate_ring() < 0) goto done;
+     break;
+    case mode_print:
+     if (print_db() < 0) goto done;
      break;
     default:
      assert(0);
