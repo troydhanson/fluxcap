@@ -58,6 +58,8 @@ struct {
   off_t map_len;
   char *time_range;
   int copy_pkt_hdr;
+  char *mark;
+  int mark_sz;
 
 } CF = {
   .mode = mode_build,
@@ -72,10 +74,11 @@ void usage() {
   fprintf(stderr, "   -d <dir>      (directory to scan for files)\n");
   fprintf(stderr, "   -r [0|1]      (scan recursively; default: 1)\n");
   fprintf(stderr, "   -s <suffix>   (only files matching suffix)\n");
-  fprintf(stderr, "   -O            (output only, skip build phase\n");
+  fprintf(stderr, "   -O            (output only, skip build phase)\n");
   fprintf(stderr, "   -o <ring>     (output sorted packets to ring)\n");
   fprintf(stderr, "   -u <a:b>      (output packets in epoch usec range)\n");
   fprintf(stderr, "   -H [0:1]      (output header on packets; def: 0)\n");
+  fprintf(stderr, "   -W <hex>      (output marker to ring after packets)\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "print mode:\n");
   fprintf(stderr, "   -p            (print db)\n");
@@ -629,11 +632,39 @@ int put_packet(const char *name, int64_t pos) {
   return rc;
 }
 
+/* unhexer, overwrites input space;
+ * returns number of bytes or -1 */
+int unhex(char *h) {
+  char b;
+  int rc = -1;
+  unsigned u;
+  size_t i, len = strlen(h);
+
+  if (len == 0) goto done;
+  if (len &  1) goto done; /* odd number of digits */
+  for(i=0; i < len; i += 2) {
+    if (sscanf( &h[i], "%2x", &u) < 1) goto done;
+    assert(u <= 255);
+    b = (unsigned char)u;
+    h[i/2] = b;
+  }
+
+  rc = 0;
+
+ done:
+  if (rc < 0) {
+    fprintf(stderr, "hex conversion failed\n");
+    return -1;
+  }
+
+  return len/2;
+}
+
 int populate_ring(void) {
+  int rc = -1, sc, sz;
   const unsigned char *name;
   int64_t pos, ts;
   sqlite3_stmt *ps;
-  int rc = -1, sc;
 
   if (setup_query(&ps) < 0) goto done;
 
@@ -645,6 +676,12 @@ int populate_ring(void) {
 
     if (put_packet(name, pos) < 0) goto done;
 
+  }
+
+  sc = CF.mark_sz ? shr_write(CF.ring, CF.mark, CF.mark_sz) : 0;
+  if (sc < 0) {
+    fprintf(stderr, "shr_write: %d\n", sc);
+    goto done;
   }
 
   rc = 0;
@@ -659,7 +696,7 @@ int main(int argc, char *argv[]) {
 
   CF.prog = argv[0];
 
-  while ( (opt = getopt(argc,argv,"vphd:r:t:s:b:u:o:OH:")) > 0) {
+  while ( (opt = getopt(argc,argv,"vphd:r:t:s:b:u:o:OH:W:")) > 0) {
     switch(opt) {
       case 'v': CF.verbose++; break;
       case 'd': dir = strdup(optarg); break;
@@ -672,21 +709,29 @@ int main(int argc, char *argv[]) {
       case 'o': CF.ring_name = strdup(optarg); break;
       case 'O': CF.mode = mode_output; break;
       case 'u': CF.time_range = strdup(optarg); break;
+      case 'W': CF.mark = strdup(optarg); break;
       case 'h': default: usage(argv[0]); break;
     }
   }
 
   if (CF.db_name == NULL) usage();
+  if (CF.mark) {
+    CF.mark_sz = unhex(CF.mark);
+    if (CF.mark_sz == -1) goto done;
+  }
+
   if (setup_db() < 0) goto done;
 
   switch (CF.mode) {
     case mode_build:
-     if (dir == NULL) usage();
-     if (realpath(dir, CF.dir) == NULL) {
-       fprintf(stderr, "realpath %s: %s\n", dir, strerror(errno));
-       goto done;
+     if ((dir == NULL) && (optind >= argc)) usage();
+     if (dir) {
+       if (realpath(dir, CF.dir) == NULL) {
+         fprintf(stderr, "realpath %s: %s\n", dir, strerror(errno));
+         goto done;
+       }
+       if (add_dir(CF.dir) < 0) goto done;
      }
-     if (add_dir(CF.dir) < 0) goto done;
      while ((optind < argc) && (add_file(argv[optind++]) < 0)) goto done;
      if (CF.ring_name == NULL) break;
      else { /* FALL THRU */ }
@@ -714,6 +759,7 @@ int main(int argc, char *argv[]) {
   if (CF.ring_name) free(CF.ring_name);
   if (CF.ring) shr_close(CF.ring);
   if (CF.time_range) free(CF.time_range);
+  if (CF.mark) free(CF.mark);
   if (CF.map_buf) munmap(CF.map_buf, CF.map_len);
   release_db();
   return rc;
