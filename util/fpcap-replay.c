@@ -23,10 +23,18 @@
  * inject the packets into an shr ring in time sorted
  * order (packets interleaved from pcaps as necessary)
  *
- * this is a batch oriented tool primarily for testing
+ * this is a batch oriented tool 
  *
  *
  */
+
+struct region {
+  int64_t beg, st;
+  int64_t end, et;
+  int64_t npkts;
+  int file_id;
+  char name[PATH_MAX];
+};
 
 struct {
   int verbose;
@@ -43,9 +51,9 @@ struct {
   char *db_name;
   sqlite3 *db;
   sqlite3_stmt *insert_stmt;
+  sqlite3_stmt *delete_regn;
   sqlite3_stmt *select_stmt;
-  sqlite3_stmt *select_rnge;
-  sqlite3_stmt *insert_rcrd;
+  sqlite3_stmt *insert_regn;
   int truncate;
 
   /* ring */
@@ -53,13 +61,17 @@ struct {
   struct shr *ring;
 
   /* output mode state */
-  char  map_name[PATH_MAX];
   char *map_buf;
   off_t map_len;
-  char *time_range;
   int copy_pkt_hdr;
   char *mark;
   int mark_sz;
+  char *time_range;      /* "a:b" */
+  long start_ts, end_ts; /*  a,b */
+
+  /* bisect work space */
+  struct region region_a;
+  struct region region_b;
 
 } CF = {
   .mode = mode_build,
@@ -76,7 +88,7 @@ void usage() {
   fprintf(stderr, "   -s <suffix>   (only files matching suffix)\n");
   fprintf(stderr, "   -O            (output only, skip build phase)\n");
   fprintf(stderr, "   -o <ring>     (output sorted packets to ring)\n");
-  fprintf(stderr, "   -u <a:b>      (output packets in epoch usec range)\n");
+  fprintf(stderr, "   -u <a:b>      (select packets in epoch usec range)\n");
   fprintf(stderr, "   -H [0:1]      (output header on packets; def: 0)\n");
   fprintf(stderr, "   -W <hex>      (output marker to ring after packets)\n");
   fprintf(stderr, "\n");
@@ -155,39 +167,39 @@ int setup_db(void) {
   sql = "INSERT INTO files VALUES ($NAME, $ID);";
   if (prep_sql(CF.db, sql, &CF.insert_stmt) < 0) goto done;
 
-  /* packets table */
-  sql = "CREATE TABLE IF NOT EXISTS packets "
-        "(id INTEGER, pos INTEGER, ts INTEGER);";
+  /* regions table */
+  sql = "CREATE TABLE IF NOT EXISTS regions "
+        "(id INTEGER, beg INTEGER, st INTEGER, end INTEGER, et INTEGER, npkts INTEGER, "
+        "CONSTRAINT pk PRIMARY KEY (id, beg, st));";
   if (exec_sql(CF.db, sql) < 0) goto done;
 
   /* truncate */
   if (CF.truncate && (CF.mode == mode_build)) {
     if (exec_sql(CF.db, "DELETE FROM files;")   < 0) goto done;
-    if (exec_sql(CF.db, "DELETE FROM packets;") < 0) goto done;
+    if (exec_sql(CF.db, "DELETE FROM regions;") < 0) goto done;
   }
 
   /* index */
-  sql = "CREATE INDEX IF NOT EXISTS by_ts ON packets(ts);";
+  sql = "CREATE INDEX IF NOT EXISTS by_ts ON regions(st);";
   if (exec_sql(CF.db, sql) < 0) goto done;
 
   /* prepare select statement */
-  sql = "SELECT f.name, p.pos, p.ts "
-        "FROM files f, packets p "
+  sql = "SELECT f.name, f.id, p.beg, p.st, p.end, p.et, p.npkts "
+        "FROM files f, regions p "
         "WHERE p.id = f.id "
-        "ORDER BY p.ts;";
+        "ORDER BY p.st;";
   if (prep_sql(CF.db, sql, &CF.select_stmt) < 0) goto done;
 
-  /* prepare select range statement */
-  sql = "SELECT f.name, p.pos, p.ts "
-        "FROM files f, packets p "
-        "WHERE p.id = f.id "
-        "  AND p.ts BETWEEN $A AND $B "
-        "ORDER BY p.ts;";
-  if (prep_sql(CF.db, sql, &CF.select_rnge) < 0) goto done;
+  /* prepare insert statement */
+  sql = "INSERT INTO regions VALUES ($ID, $BEG, $ST, $END, $ET, $NPKTS);";
+  if (prep_sql(CF.db, sql, &CF.insert_regn) < 0) goto done;
 
-  /* prepare insert statement - we substitute values in later */
-  sql = "INSERT INTO packets VALUES ($ID, $POS, $TS);";
-  if (prep_sql(CF.db, sql, &CF.insert_rcrd) < 0) goto done;
+  /* prepare delete statement */
+  sql = "DELETE FROM regions "
+        "WHERE id = $ID "
+        "  AND beg = $BEG "
+        "  AND st  = $ST ";
+  if (prep_sql(CF.db, sql, &CF.delete_regn) < 0) goto done;
 
   rc = 0;
 
@@ -252,39 +264,14 @@ char *map(const char *file, size_t *len) {
   return (rc < 0) ? NULL : buf;
 }
 
-
-int insert_file(sqlite3_stmt *ps, char *name, int id) {
+int insert_region(sqlite3_stmt *ps, int id, size_t beg, int64_t st, 
+                                            size_t end, int64_t et,
+                                            int64_t npkts) {
   int sc, rc = -1;
-  
-  sc = sqlite3_bind_text(ps, 1, name, -1, SQLITE_TRANSIENT);
-  if (sc != SQLITE_OK) {
-    fprintf(stderr, "sqlite3_bind_text: %s\n", sqlite3_errstr(sc));
-    goto done;
-  }
 
-  sc = sqlite3_bind_int( ps, 2, id);
-  if (sc != SQLITE_OK) {
-    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
-    goto done;
-  }
-
-  /* insert */
-  sc = sqlite3_step(ps);
-  if (sc != SQLITE_DONE) {
-    fprintf(stderr,"sqlite3_step: unexpected result\n");
-    goto done;
-  }
-
-  if (reset(ps) < 0) goto done;
-
-  rc = 0;
-
- done:
-  return rc;
-}
-
-int insert_packet(sqlite3_stmt *ps, int id, size_t pos, int64_t ts) {
-  int sc, rc = -1;
+  if (CF.verbose) fprintf(stderr, "inserting region id %d beg %ld st %ld "
+                                  "end %ld et %ld npkts %ld\n",
+     id, (long)beg, (long)st, (long)end, (long)et, (long)npkts);
   
   sc = sqlite3_bind_int( ps, 1, id);
   if (sc != SQLITE_OK) {
@@ -292,13 +279,31 @@ int insert_packet(sqlite3_stmt *ps, int id, size_t pos, int64_t ts) {
     goto done;
   }
 
-  sc = sqlite3_bind_int64( ps, 2, pos);
+  sc = sqlite3_bind_int64( ps, 2, beg);
   if (sc != SQLITE_OK) {
     fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
     goto done;
   }
 
-  sc = sqlite3_bind_int64( ps, 3, ts);
+  sc = sqlite3_bind_int64( ps, 3, st);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_bind_int64( ps, 4, end);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_bind_int64( ps, 5, et);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_bind_int64( ps, 6, npkts);
   if (sc != SQLITE_OK) {
     fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
     goto done;
@@ -323,13 +328,12 @@ const uint8_t pcap_magic_number[] = { 0xd4, 0xc3, 0xb2, 0xa1 };
 const int pcap_glb_hdrlen = 24;
 const int pcap_pkt_hdrlen = (sizeof(uint32_t) * 4);
 
-
-/* scan file and enter its packets into table */
-int get_packets(sqlite3_stmt *ps, char *file, int id) {
+int get_extents(sqlite3_stmt *ps, char *file, int id) {
   int sc, rc = -1;
   size_t len, plen;
   char *p, *buf=NULL;
-  uint64_t ts;
+  int64_t beg=0, end=0;
+  int64_t st,et,npkts=0;
 
   buf = map(file, &len);
   if (buf == NULL) goto done;
@@ -356,10 +360,20 @@ int get_packets(sqlite3_stmt *ps, char *file, int id) {
     uint32_t *incl_len = (uint32_t*)(p + sizeof(uint32_t)*2);
     uint32_t *orig_len = (uint32_t*)(p + sizeof(uint32_t)*3);
     plen = pcap_pkt_hdrlen + *incl_len;
-    ts = (*sec) * 1000000L + (*usec);
-    sc = insert_packet(ps, id, p-buf, ts);
-    if (sc < 0) goto done;
+    if (p+plen > buf+len) goto done;
+    /* record as if this is the last packet in the pcap (it might be) */
+    end = p - buf;
+    et = (*sec) * 1000000L + (*usec);
+    /* if this is the first packet in the pcap, record its beg/st too */
+    if (beg == 0) {
+      beg = end;
+      st = et;
+    }
+    npkts++;
   }
+
+  sc = insert_region(ps, id, beg, st, end, et, npkts);
+  if (sc < 0) goto done;
 
   rc = 0;
 
@@ -368,15 +382,45 @@ int get_packets(sqlite3_stmt *ps, char *file, int id) {
   return rc;
 }
 
+
+int insert_file(sqlite3_stmt *ps, char *name, int id) {
+  int sc, rc = -1;
+  
+  sc = sqlite3_bind_text(ps, 1, name, -1, SQLITE_TRANSIENT);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_text: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_bind_int( ps, 2, id);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  /* insert */
+  sc = sqlite3_step(ps);
+  if (sc != SQLITE_DONE) {
+    fprintf(stderr,"sqlite3_step: unexpected result\n");
+    goto done;
+  }
+
+  if (reset(ps) < 0) goto done;
+
+  /* insert min/max packets into regions table */
+  if (get_extents(CF.insert_regn, name, id) < 0) goto done;
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
+
 int add_file(char *file) {
   int rc = -1, sc;
 
-  /* add file reference to file table */
   sc = insert_file(CF.insert_stmt, file, CF.file_id);
-  if (sc < 0) goto done;
-
-  /* open the file up, find packets, insert them */
-  sc = get_packets(CF.insert_rcrd, file, CF.file_id);
   if (sc < 0) goto done;
 
   CF.file_id++;
@@ -454,8 +498,8 @@ int add_dir(char *dir) {
     }
 
     if (S_ISREG(s.st_mode) && is_suffix(path)) {
-      if (add_file(path) < 0) goto done;
       if (CF.verbose) fprintf(stderr, "adding regular file %s\n", path);
+      if (add_file(path) < 0) goto done;
     } 
 
     if (CF.recurse && (S_ISDIR(s.st_mode)))  {
@@ -480,13 +524,6 @@ int release_db(void) {
     goto done;
   }
 
-  /* done with select range statement */
-  sc = sqlite3_finalize(CF.select_rnge);
-  if (sc != SQLITE_OK) {
-    fprintf(stderr,"sqlite3_finalize: %s\n", sqlite3_errstr(sc));
-    goto done;
-  }
-
   /* done with insert statement */
   sc = sqlite3_finalize(CF.insert_stmt);
   if (sc != SQLITE_OK) {
@@ -495,7 +532,14 @@ int release_db(void) {
   }
 
   /* done with insert statement */
-  sc = sqlite3_finalize(CF.insert_rcrd);
+  sc = sqlite3_finalize(CF.insert_regn);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr,"sqlite3_finalize: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  /* done with delete statement */
+  sc = sqlite3_finalize(CF.delete_regn);
   if (sc != SQLITE_OK) {
     fprintf(stderr,"sqlite3_finalize: %s\n", sqlite3_errstr(sc));
     goto done;
@@ -509,60 +553,35 @@ int release_db(void) {
   return rc;
 }
 
-int setup_query(sqlite3_stmt **ps) {
-  long start_ts, end_ts;
-  int rc = -1, sc;
-
-  if (CF.time_range == NULL) { /* not range limited? */
-    *ps = CF.select_stmt;
-    rc = 0;
-    goto done;
-  }
-
-  /* bind parameters to date range */
-  *ps = CF.select_rnge;
-
-  sc = sscanf(CF.time_range, "%ld:%ld", &start_ts, &end_ts);
-  if (sc != 2) {
-    fprintf(stderr, "time range must be in START:STOP format\n");
-    goto done;
-  }
-
-  sc = sqlite3_bind_int64( *ps, 1, start_ts);
-  if (sc != SQLITE_OK) {
-    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
-    goto done;
-  }
-
-  sc = sqlite3_bind_int64( *ps, 2, end_ts);
-  if (sc != SQLITE_OK) {
-    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
-    goto done;
-  }
-
-  rc = 0;
-
- done:
-  return rc;
-}
 
 int print_db(void) {
   const unsigned char *name;
   sqlite3_stmt *ps;
-  int64_t pos, ts;
+  int64_t beg, st;
+  int64_t end, et;
+  int64_t id, npkts, n=0;
   int rc = -1;
 
-  if (setup_query(&ps) < 0) goto done;
+  ps = CF.select_stmt;
+  if (reset(ps) < 0) goto done;
+  fprintf(stderr, "\n");
 
   while (sqlite3_step(ps) == SQLITE_ROW) {
 
-    name = sqlite3_column_text(ps, 0);
-    pos = sqlite3_column_int64(ps, 1);
-    ts  = sqlite3_column_int64(ps, 2);
+    name =   sqlite3_column_text(ps, 0);
+    id  =   sqlite3_column_int64(ps, 1);
+    beg =   sqlite3_column_int64(ps, 2);
+    st  =   sqlite3_column_int64(ps, 3);
+    end =   sqlite3_column_int64(ps, 4);
+    et  =   sqlite3_column_int64(ps, 5);
+    npkts = sqlite3_column_int64(ps, 6);
 
-    printf("%s: pos %ld: usec: %ld\n", name, (long)pos, (long)ts);
+    fprintf(stderr, " %ld> %s beg %ld st %ld end %ld et %ld npkts %ld\n", 
+      ++n, name, (long)beg, (long)st, (long)end, (long)et, (long)npkts);
 
   }
+  fprintf(stderr, "\n");
+  reset(ps);
 
   rc = 0;
 
@@ -570,65 +589,63 @@ int print_db(void) {
   return rc;
 }
 
-int put_packet(const char *name, int64_t pos) {
-  int rc = -1, need_map, sc;
-  size_t len, plen;
-  char *p, *eob;
+int get_region_packets(struct region *r) {
+  int rc = -1, need_map, sc, skip;
+  size_t len, plen, sz;
+  char *p, *eob, *pkt;
+  uint64_t ts;
 
-  /* is the right file already mapped into memory? */
-  len = strlen(name);
-  need_map = CF.map_buf ?  memcmp(name, CF.map_name, len+1) : 1;
+  assert(CF.map_buf == NULL);
 
-  if (need_map && CF.map_buf) {
-    sc = munmap(CF.map_buf, CF.map_len);
-    if (sc < 0) {
-      fprintf(stderr, "munmap: %s\n", strerror(errno));
+  CF.map_buf = map(r->name, &CF.map_len);
+  if (CF.map_buf == NULL) goto done;
+
+  eob = CF.map_buf + CF.map_len;
+  for (p = CF.map_buf + r->beg; p < eob; p += plen) {
+
+    /* find packet length. we want incl_len. */
+    uint32_t *sec =      (uint32_t*)(p + sizeof(uint32_t)*0);
+    uint32_t *usec =     (uint32_t*)(p + sizeof(uint32_t)*1);
+    uint32_t *incl_len = (uint32_t*)(p + sizeof(uint32_t)*2);
+    uint32_t *orig_len = (uint32_t*)(p + sizeof(uint32_t)*3);
+
+    plen = pcap_pkt_hdrlen + *incl_len;
+    if (p + plen > eob) {
+      fprintf(stderr, "packet data out of bounds\n");
       goto done;
     }
-    CF.map_buf = NULL;
-  }
 
-  if (need_map) {
-    CF.map_buf = map(name, &CF.map_len);
-    if (CF.map_buf == NULL) goto done;
-    memcpy(CF.map_name, name, len+1);
-  }
+    ts = (*sec) * 1000000L + (*usec);
 
-  /* the right file is mapped into memory. */
-  assert(CF.map_buf);
-  assert(CF.map_len > pos);
-  eob = CF.map_buf + CF.map_len;
+    skip = 0;
+    if (CF.start_ts && (ts < CF.start_ts)) skip=1;
+    if (CF.end_ts   && (ts > CF.end_ts)) skip=1;
 
-  p = CF.map_buf + pos;
-  if (p + pcap_pkt_hdrlen > eob) {
-    fprintf(stderr, "packet header out of bounds\n");
-    goto done;
-  }
+    if (CF.copy_pkt_hdr) {
+      pkt = p;
+      sz = plen;
+    } else {
+      pkt = p + pcap_pkt_hdrlen;
+      sz = plen - pcap_pkt_hdrlen;
+    }
 
-  /* find packet length. we want incl_len. */
-  uint32_t *sec =      (uint32_t*)(p + sizeof(uint32_t)*0);
-  uint32_t *usec =     (uint32_t*)(p + sizeof(uint32_t)*1);
-  uint32_t *incl_len = (uint32_t*)(p + sizeof(uint32_t)*2);
-  uint32_t *orig_len = (uint32_t*)(p + sizeof(uint32_t)*3);
+    sc = skip ? 0 : shr_write(CF.ring, pkt, sz);
+    if (sc < 0) {
+      fprintf(stderr, "shr_write: %d\n", sc);
+      goto done;
+    }
 
-  plen = *incl_len;
-  if (p + pcap_pkt_hdrlen + plen > eob) {
-    fprintf(stderr, "packet data out of bounds\n");
-    goto done;
-  }
-
-  char *pkt = CF.copy_pkt_hdr ? p : (p + pcap_pkt_hdrlen);
-  size_t sz = CF.copy_pkt_hdr ? (pcap_pkt_hdrlen + plen) : plen;
-
-  sc = shr_write(CF.ring, pkt, sz);
-  if (sc < 0) {
-    fprintf(stderr, "shr_write: %d\n", sc);
-    goto done;
+    /* did we just enqueue the last packet in the region? */
+    if ((p - CF.map_buf) == r->end) break;
   }
 
   rc = 0;
 
  done:
+  if (CF.map_buf) {
+    munmap(CF.map_buf, CF.map_len);
+    CF.map_buf = NULL;
+  }
   return rc;
 }
 
@@ -661,21 +678,29 @@ int unhex(char *h) {
 }
 
 int populate_ring(void) {
-  int rc = -1, sc, sz;
+  int rc = -1, sc, sz, len;
   const unsigned char *name;
-  int64_t pos, ts;
+  int64_t id, pos, ts;
   sqlite3_stmt *ps;
 
-  if (setup_query(&ps) < 0) goto done;
+  ps = CF.select_stmt;
+  if (reset(ps) < 0) goto done;
 
   while (sqlite3_step(ps) == SQLITE_ROW) {
 
-    name = sqlite3_column_text(ps, 0);
-    pos = sqlite3_column_int64(ps, 1);
-    ts  = sqlite3_column_int64(ps, 2);
+    name =                 sqlite3_column_text(ps, 0);
+    CF.region_a.file_id = sqlite3_column_int64(ps, 1);
+    CF.region_a.beg =     sqlite3_column_int64(ps, 2);
+    CF.region_a.st  =     sqlite3_column_int64(ps, 3);
+    CF.region_a.end =     sqlite3_column_int64(ps, 4);
+    CF.region_a.et  =     sqlite3_column_int64(ps, 5);
+    CF.region_a.npkts=    sqlite3_column_int64(ps, 6);
 
-    if (put_packet(name, pos) < 0) goto done;
+    len = strlen(name);
+    assert(len < sizeof(CF.region_a.name));
+    memcpy(CF.region_a.name, name, len+1);
 
+    if (get_region_packets(&CF.region_a) < 0) goto done;
   }
 
   sc = CF.mark_sz ? shr_write(CF.ring, CF.mark, CF.mark_sz) : 0;
@@ -690,9 +715,164 @@ int populate_ring(void) {
   return rc;
 }
 
+int delete_region(struct region *r) {
+  int sc, rc = -1;
+  sqlite3_stmt *ps;
+
+  if (CF.verbose) {
+    fprintf(stderr, "deleting region id %ld beg %ld st %ld npkts %ld\n",
+     (long)r->file_id, (long)r->beg, (long)r->st, (long)r->npkts);
+  }
+
+  ps = CF.delete_regn;
+  if (reset(ps) < 0) goto done;
+
+  sc = sqlite3_bind_int( ps, 1, r->file_id);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_bind_int64( ps, 2, r->beg);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_bind_int64( ps, 3, r->st);
+  if (sc != SQLITE_OK) {
+    fprintf(stderr, "sqlite3_bind_int: %s\n", sqlite3_errstr(sc));
+    goto done;
+  }
+
+  sc = sqlite3_step(ps);
+  if (sc != SQLITE_DONE) {
+    fprintf(stderr,"sqlite3_step: unexpected result\n");
+    goto done;
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
+int bisect_region(sqlite3_stmt *ps, struct region *r) {
+  int64_t pn, end_region_1, beg_region_2, pos, ts;
+  char *buf = NULL, *p, *eob;
+  int sc, rc = -1;
+  uint32_t plen;
+  size_t len;
+
+  if (r->npkts == 1) {   /* is the region already indivisible? */
+    rc = 0;
+    goto done;
+  }
+
+  if (delete_region(r) < 0) goto done;
+
+  end_region_1 = r->npkts / 2;      /* pn where region 1 ends */
+  beg_region_2 = end_region_1 + 1;  /* pn where region 2 starts */
+
+  /* map in the file so we can find a packet boundary */
+  buf = map(r->name, &len);
+  if (buf == MAP_FAILED) {
+    fprintf(stderr, "mmap: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* find packet halfway between beg and end */
+  pn = 0;
+  eob = buf + len;
+  for( p = buf + r->beg; p < eob; p += plen) {
+    uint32_t *sec =      (uint32_t*)(p + sizeof(uint32_t)*0);
+    uint32_t *usec =     (uint32_t*)(p + sizeof(uint32_t)*1);
+    uint32_t *incl_len = (uint32_t*)(p + sizeof(uint32_t)*2);
+    uint32_t *orig_len = (uint32_t*)(p + sizeof(uint32_t)*3);
+
+    plen = pcap_pkt_hdrlen + *incl_len;
+    if (p + plen > eob) {
+      fprintf(stderr, "packet data out of bounds\n");
+      goto done;
+    }
+
+    pos = p - buf;
+    ts = (*sec) * 1000000L + (*usec);
+    pn++;
+
+    if (pn == end_region_1) {
+      sc = insert_region(ps, r->file_id, r->beg, r->st, pos, ts, pn);
+      if (sc < 0) goto done;
+    }
+
+    if (pn == beg_region_2) {
+      sc = insert_region(ps, r->file_id, pos, ts, r->end, r->et, r->npkts-pn+1);
+      if (sc < 0) goto done;
+      break;
+    }
+  }
+
+  rc = 0;
+ 
+ done:
+  if (buf && (buf != MAP_FAILED)) munmap(buf,len);
+  return rc;
+}
+
+int bisect_sort(void) {
+  const unsigned char *name;
+  sqlite3_stmt *ps;
+  int sc, rc = -1;
+  size_t len;
+
+  memset(&CF.region_a, 0, sizeof(CF.region_a));
+  memset(&CF.region_b, 0, sizeof(CF.region_b));
+
+  if (CF.verbose) print_db();
+  ps = CF.select_stmt;
+  if (reset(ps) < 0) goto done;
+
+  while (sqlite3_step(ps) == SQLITE_ROW) {
+
+    name =                 sqlite3_column_text(ps, 0);
+    CF.region_a.file_id = sqlite3_column_int64(ps, 1);
+    CF.region_a.beg =     sqlite3_column_int64(ps, 2);
+    CF.region_a.st  =     sqlite3_column_int64(ps, 3);
+    CF.region_a.end =     sqlite3_column_int64(ps, 4);
+    CF.region_a.et  =     sqlite3_column_int64(ps, 5);
+    CF.region_a.npkts=    sqlite3_column_int64(ps, 6);
+
+    len = strlen(name);
+    assert(len < sizeof(CF.region_a.name));
+    memcpy(CF.region_a.name, name, len+1);
+
+    /* is region disjoint from previous region? */
+    if (CF.region_a.st >= CF.region_b.et) {
+      CF.region_b = CF.region_a; /* struct copy */
+      continue;
+    }
+
+    /* region_a overlaps region_b. bisect both. */
+    if (CF.verbose) fprintf(stderr, "bisecting\n");
+    if (bisect_region(CF.insert_regn, &CF.region_a) < 0) goto done;
+    if (bisect_region(CF.insert_regn, &CF.region_b) < 0) goto done;
+
+    if (CF.verbose) print_db();
+
+    if (reset(ps) < 0) goto done;
+    memset(&CF.region_a, 0, sizeof(CF.region_a));
+    memset(&CF.region_b, 0, sizeof(CF.region_b));
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
 int main(int argc, char *argv[]) {
   char *dir = NULL;
-  int opt, rc=-1;
+  int sc, opt, rc=-1;
 
   CF.prog = argv[0];
 
@@ -720,6 +900,14 @@ int main(int argc, char *argv[]) {
     if (CF.mark_sz == -1) goto done;
   }
 
+  if (CF.time_range) {
+    sc = sscanf(CF.time_range, "%ld:%ld", &CF.start_ts, &CF.end_ts);
+    if (sc != 2) {
+      fprintf(stderr, "time range must be in START:STOP format\n");
+      goto done;
+    }
+  }
+
   if (setup_db() < 0) goto done;
 
   switch (CF.mode) {
@@ -733,6 +921,7 @@ int main(int argc, char *argv[]) {
        if (add_dir(CF.dir) < 0) goto done;
      }
      while ((optind < argc) && (add_file(argv[optind++]) < 0)) goto done;
+     if (bisect_sort() < 0) goto done;
      if (CF.ring_name == NULL) break;
      else { /* FALL THRU */ }
     case mode_output:
