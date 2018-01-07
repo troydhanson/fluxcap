@@ -1,0 +1,13 @@
+2 sources, 3 regions
+ 0: [0,2]:  test24.c.in1
+ 1: [2,3]:  test24.c.in2 test24.c.in1
+ 2: [3,5]:  test24.c.in1
+   -> 0a
+   -> 1a
+   -> 2a
+   -> 2b
+ * -> 3b
+   -> 3a
+   -> 4a
+ * -> 5a
+eof

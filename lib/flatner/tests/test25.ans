@@ -1,0 +1,14 @@
+2 sources, 2 regions
+ 0: [0,5]:  test25.c.in1
+ 1: [6,9]:  test25.c.in2
+   -> 0a
+   -> 1a
+   -> 2a
+   -> 3a
+   -> 4a
+ * -> 5a
+   -> 6b
+   -> 7b
+   -> 8b
+ * -> 9b
+eof

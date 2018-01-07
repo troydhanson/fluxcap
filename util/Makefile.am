@@ -1,6 +1,6 @@
 srcdir = @srcdir@
 
-bin_PROGRAMS = ramdisk watch_copy
+bin_PROGRAMS = ramdisk watch_copy fpcap-replay
 ramdisk_SOURCES = ramdisk.c
 ramdisk_CPPFLAGS = -I$(srcdir)/../lib/libut/include 
 
@@ -23,11 +23,12 @@ fluxtop_LDADD = -L../lib -lut -ltpl -lncurses -lshr
 endif
 
 if HAVE_SQLITE3
-bin_PROGRAMS += fprune fpcap-replay
+bin_PROGRAMS += fprune
 fprune_SOURCES = fprune.c
 fprune_CPPFLAGS = -I$(srcdir)/../lib/libut/include -I$(srcdir)/../lib/tpl/src
 fprune_LDADD = -L../lib -lut -lshr -ltpl -lsqlite3
-fpcap_replay_SOURCES = fpcap-replay.c
-fpcap_replay_CPPFLAGS =
-fpcap_replay_LDADD = -lshr -lsqlite3
 endif
+
+fpcap_replay_SOURCES = fpcap-replay.c
+fpcap_replay_CPPFLAGS = -I$(srcdir)/../lib/libut/include -I$(srcdir)/../lib/flatner
+fpcap_replay_LDADD = -L../lib -lflatner -lut -lshr

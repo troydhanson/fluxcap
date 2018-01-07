@@ -1,0 +1,9 @@
+1 sources, 1 regions
+ 0: [0,5]:  test22.c.in1
+   -> 0a
+   -> 1a
+   -> 2a
+   -> 3a
+   -> 4a
+ * -> 5a
+eof

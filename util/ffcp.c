@@ -547,9 +547,10 @@ int process(char *file, size_t len) {
 }
 
 int handle_io(void) {
-  int rc = -1, iovcnt, i;
   struct iovec *iov;
+  int rc = -1, i;
   ssize_t rv, wc;
+  size_t iovcnt;
 
   iovcnt = BATCH_FRAMES;
   rv = shr_readv(cfg.ring, cfg.buf, BATCH_BYTES, cfg.iov, &iovcnt);

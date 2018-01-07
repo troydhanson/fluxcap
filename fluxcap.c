@@ -807,11 +807,12 @@ char *inject_vlan(char *tx, ssize_t *nx, uint16_t vlan) {
 }
 
 int tee_packet(void) {
-  int rc=-1, n, nio;
+  struct iovec *io;
   ssize_t nr,nt,nx;
   struct shr **r;
+  int rc=-1, n;
   struct bb *b;
-  struct iovec *io;
+  size_t nio;
 
   /* get pointers and lengths for the iov vector */
   utvector_clear(cfg.rb.iov);
@@ -826,7 +827,6 @@ int tee_packet(void) {
   }
 
   /* record in vector number of used iov slots */
-  if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
   assert(nio <= cfg.rb.iov->n);
   cfg.rb.iov->i = nio;
 
@@ -927,13 +927,14 @@ int wait_for_tx_space(void) {
 }
 
 int transmit_packets(void) {
-  int rc=-1, n, nio, len, nq=0, failsafe=0;
-  struct sockaddr_in sin;
+  int rc=-1, n, len, nq=0, failsafe=0;
   struct sockaddr *dst = NULL;
+  struct sockaddr_in sin;
   ssize_t nr,nt,nx;
   struct iovec *io;
   socklen_t sz = 0;
   uint8_t *mac;
+  size_t nio;
 
   /* get pointer to iov array to be populated */
   utvector_clear(cfg.rb.iov);
@@ -1183,9 +1184,10 @@ int receive_packets(void) {
  * writing them to the primary
  */
 int funnel(int pos) {
-  ssize_t nr, wr;
   struct iovec *io;
-  int rc = -1, nio;
+  ssize_t nr, wr;
+  int rc = -1;
+  size_t nio;
 
   struct shr **r = (struct shr**)utvector_elt(cfg.aux_rings, pos);
   assert(r);
@@ -1203,7 +1205,6 @@ int funnel(int pos) {
   }
 
   /* record in vector number of used iov slots */
-  if (cfg.verbose) fprintf(stderr,"readv: %d packets\n", nio);
   assert(nio <= cfg.rb.iov->n);
   cfg.rb.iov->i = nio;
 
@@ -1444,8 +1445,8 @@ int main(int argc, char *argv[]) {
       if (cfg.size == 0) usage();
       while (optind < argc) {
         file = argv[optind++];
+        init_mode = SHR_KEEPEXIST|SHR_DROP;
         if (cfg.verbose) fprintf(stderr,"creating %s\n", file);
-        init_mode = SHR_KEEPEXIST|SHR_MESSAGES|SHR_DROP;
         if (shr_init(file, cfg.size, init_mode) < 0) goto done;
       }
       rc = 0;

@@ -361,9 +361,10 @@ int handle_worker(void) {
 }
 
 int handle_io(void) {
-  int rc = -1, iovcnt, i;
   struct iovec *iov;
+  int rc = -1, i;
   ssize_t rv, wc;
+  size_t iovcnt;
 
   iovcnt = BATCH_FRAMES;
   rv = shr_readv(cfg.ring, cfg.buf, BATCH_BYTES, cfg.iov, &iovcnt);
@@ -1177,7 +1178,7 @@ int main(int argc, char *argv[]) {
   if (start_scanner() < 0) goto done;
 
   /* open the ring */
-  int init_mode = SHR_KEEPEXIST|SHR_MESSAGES|SHR_DROP;
+  int init_mode = SHR_KEEPEXIST|SHR_DROP;
   if (shr_init(cfg.ring_name, cfg.ring_def_sz, init_mode) < 0) goto done;
   cfg.ring = shr_open(cfg.ring_name, SHR_RDONLY|SHR_NONBLOCK);
   if (cfg.ring == NULL) goto done;

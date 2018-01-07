@@ -1,0 +1,15 @@
+2 sources, 1 regions
+ 0: [0,5]:  test23.c.in1 test23.c.in2
+   -> 0a
+   -> 0a
+   -> 1a
+   -> 1a
+   -> 2a
+   -> 2a
+   -> 3a
+   -> 3a
+   -> 4a
+   -> 4a
+ * -> 5a
+ * -> 5a
+eof

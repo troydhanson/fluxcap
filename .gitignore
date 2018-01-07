@@ -1,8 +1,12 @@
 fluxtop
 fluxcap
 ramdisk
+fpcap-replay
+fprune
 watch_copy
 *.o
+*.a
+.dirstamp
 *.swp
 Makefile.in
 aclocal.m4
