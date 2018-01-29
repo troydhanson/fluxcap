@@ -16,10 +16,6 @@ endif
 endif
 
 if HAVE_NCURSES
-bin_PROGRAMS += fluxtop
-fluxtop_SOURCES = fluxtop.c
-fluxtop_CPPFLAGS = -I$(srcdir)/../lib/libut/include -I$(srcdir)/../lib/tpl/src
-fluxtop_LDADD = -L../lib -lut -ltpl -lncurses -lshr
 endif
 
 if HAVE_SQLITE3

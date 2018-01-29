@@ -34,7 +34,8 @@ handling of TCP/IP packets in the kernel. In fact it is recommended to drop
 all regular packet communication using `iptables` as shown below so that only
 the raw socket can generate or respond to packets on the dedicated NICs.
 
-A tool, `fluxtop`, is included to watch the rx/tx rates in a top-like manner.
+An ncurses-based visual mode can be used to observe the ring I/O status.
+Invoke it using `fluxcap -io <ring> ...` to monitor one or more rings.
 No claims are made with regard to performance. Rates of 2-3 gigabit/sec
 were used in development, and higher rates surely require improvements.
 
@@ -79,7 +80,7 @@ In the top-level fluxcap directory, run:
     make
     sudo make install
 
-This places `fluxcap`, `fluxtop` and `ramdisk` in the default bindir,
+This places `fluxcap`, and `ramdisk` in the default bindir,
 typically `/usr/local/bin`.
 
 ## Usage
@@ -124,9 +125,9 @@ unconfigured interfaces, and keeps the system from reacting to the tap traffic.
 Suppose you have a quad-NIC server, to be used in this way:
 
     eth0: management network
-    eth1: network tap (INPUT)
-    eth2: network tap replicate #1 (OUTPUT)
-    eth3: network tap replicate #2 (OUTPUT)
+    eth1: tap from vlan 1  (INPUT)
+    eth2: tap replicate #1 (OUTPUT)
+    eth3: tap replicate #2 (OUTPUT)
 
 This is how you would set up this arrangement using fluxcap:
 
@@ -134,16 +135,14 @@ This is how you would set up this arrangement using fluxcap:
     ramdisk -c -s 1g /ramdisk      # mount a 1 gb tmpfs ramdisk
     cd /ramdisk
 
-    fluxcap -cr -s 100m i1 o1 o2   # create ring buffers of size 100m
-    fluxcap -rx -i eth1 i1 &       # capture from eth1 into i1
-    fluxcap -T i1 o1 o2 &          # tee i1 to o1 and o2
-    fluxcap -tx -i eth2 o1 &       # transmit o1 on eth2
-    fluxcap -tx -i eth3 o2 &       # transmit o2 on eth3
+    fluxcap -cr -s 100m vlan1      # create ring buffer named vlan1
+    fluxcap -rx -i eth1 vlan1 &    # capture from eth1 into vlan1
+    fluxcap -tx -i eth2 vlan1 &    # transmit vlan1 on eth2
+    fluxcap -tx -i eth3 vlan1 &    # transmit vlan1 on eth3
 
-At this point you could use `fluxtop` to watch the I/O rates on the three
-buffers.
+At this point you could use watch the I/O rates using `fluxcap -io`:
 
-    fluxtop i1 o1 o2
+    fluxcap -io vlan1
 
 ### Tap aggregation
 
@@ -202,16 +201,16 @@ If you aggregate two 1 gigabit/sec taps together, and attempt to retransmit
 the resulting 2 gigabits/sec on another 1 gigabit/sec link, expect packet loss.
 
 In reality, some gigabit links are barely utilized, and you can aggregate many
-of them together and send them out another gigabit link. You can use `fluxtop`
-to see the I/O rates and loss on the ring buffers.
+of them together and send them out another gigabit link. You can see the I/O
+rates and loss on the ring buffers in an ncurses interface like this:
 
-A ring in fluxcap is meant to have one receiver and one transmitter. In other
-words to transmit a ring on two NIC's, you need to "tee" it as shown.
+    fluxcap -io <ring> ...
 
-A ring can be created on a regular disk filesystem rather than a ramdisk, but
-this is not recommended except on low volume taps. (Internally, fluxcap maps
-the ring buffers into shared memory between receivers and transmitters).
+In early versions of fluxcap, a ring could have one receiver and one transmitter. 
+This required use of a "tee" (`-T` mode) to duplicate or triplicate a ring.
+This is no longer necessary. Many fluxcap processes can read from one ring.
 
+A ring should be created on a ramdisk (tmpfs filesystem) only, for performance.
 Based on experience it is advisable to keep a tmpfs ramdisk under 50% full.
 
 #### Persistent operation

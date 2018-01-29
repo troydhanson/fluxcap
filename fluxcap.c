@@ -1,71 +1,57 @@
-#include <errno.h>
-#include <sys/epoll.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/signalfd.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
 #include <linux/if_packet.h>
-#include <net/if.h>
 #include <net/ethernet.h>
+#include <sys/signalfd.h>
+#include <sys/timerfd.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
 #include <arpa/inet.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <net/if.h>
 #include <assert.h>
+#include <stdio.h>
+#include <errno.h>
 #include <poll.h>
 #include "shr.h"
 #include "libut.h"
+#include "fluxcap.h"
 
 /* 
  * fluxcap: a network tap replication and aggregation tool
  *
  */
-#define FLUXCAP_VERSION "1.3"
-#define MAX_PKT 100000         /* max length of packet */
-#define MAX_NIC 64             /* longest NIC name we accept */
-#define BATCH_SIZE (1024*1024) /* bytes buffered before shr_writev */
-#define BATCH_PKTS 10000       /* max pkts to read in one shr_readv */
-struct bb {
-  size_t n; /* batch buffer size */
-  size_t u; /* batch buffer used */
-  char  *d; /* batch buffer */
-  UT_vector /* of struct iovec */ *iov; 
-};
-
-struct encap { /* this is used in tx GRE/ERSPAN encapsulation mode */
-  int enable;
-  enum {mode_gre=0, mode_gretap, mode_erspan} mode;
-  struct in_addr dst;
-  int session;             /* TODO make configurable */
-  uint32_t session_seqno;  /* TODO should be kept per-session */
-};
-
 struct {
   int verbose;
   char *prog;
   enum {mode_none, mode_transmit, mode_receive, mode_create, 
-        mode_tee, mode_funnel} mode;
+        mode_tee, mode_funnel, mode_watch} mode;
   char *file;
   char dev[MAX_NIC];
-  int ticks;
+  unsigned long ticks;
   int vlan;
   int tail;
   int fd;
   int tx_fd;
   int signal_fd;
+  int timer_fd;
   int epoll_fd;
   char pkt[MAX_PKT];
   struct shr *ring;
   size_t size; /* ring create size (-cr), or snaplen (-rx/-tx) */
   struct encap encap;
+  struct itimerspec timer;
   /* auxilliary rings; for tee or funnel modes */
-  UT_vector /* of ptr */ *aux_rings; 
-  UT_vector /* of int */ *aux_fd; 
-  UT_vector /* of utstring */ *aux_names; 
-  UT_vector /* of struct bb */ *tee_bb; 
+  UT_vector /* of ptr */ *aux_rings;
+  UT_vector /* of int */ *aux_fd;
+  UT_vector /* of utstring */ *aux_names;
+  UT_vector /* of utstring */ *tmp_files;
+  UT_vector /* of struct bb */ *tee_bb;
+  UT_vector /* of struct ww */ *watch_win;
   UT_string *tmp;
   struct timeval now;
   struct bb bb; /* output shr ring batch buffer; accumulates til shr_writev */
@@ -78,22 +64,29 @@ struct {
   unsigned ring_frame_sz; /* snaplen */
   unsigned ring_curr_idx; /* slot index in ring buffer */
   unsigned ring_frame_nr; /* redundant, total frame count */
-  int losing;     /* packets loss since last reset (boolean) */
   int strip_vlan; /* strip VLAN on rx if present (boolean) */
   int drop_pct;   /* sampling % 0 (keep all)-100(drop all) */
   int use_tx_ring; /* 0 = sendto-based tx; 1=packet mmap ring-based tx */
   int keep_going_on_tx_err;  /* ignore tx errors from malformed packets */
   int bypass_qdisc_on_tx; /* bypass kernel qdisc layer, more risk of loss */
+  struct fluxcap_stats stats; /* used to periodically update rx/rd stats */
+  struct watch_ui ui;  /* in mode_watch, display state */
+  int keep; /* in mode_create, keep existing ring if present */
 } cfg = {
   .bb.n = BATCH_SIZE,
   .rb.n = BATCH_SIZE,
   .fd = -1,
   .tx_fd = -1,
   .signal_fd = -1,
+  .timer_fd = -1,
   .epoll_fd = -1,
   .ring_block_sz = 1 << 22, /*4 mb; want powers of two due to kernel allocator*/
   .ring_block_nr = 64,
   .ring_frame_sz = 1 << 11, /* 2048 for MTU & header, divisor of ring_block_sz*/
+  .timer = {
+    .it_value =    { .tv_sec = 0, .tv_nsec = 1 },
+    .it_interval = { .tv_sec = 0, .tv_nsec = 1000000000UL / TIMER_HZ },
+  },
 };
 
 /*
@@ -134,6 +127,10 @@ UT_mm bb_mm = {
   .clear = bb_clear,
 };
 
+UT_mm ww_mm = {
+  .sz = sizeof(struct ww),
+};
+
 
 UT_mm _utmm_ptr = {.sz = sizeof(void*)};
 UT_mm* utmm_ptr = &_utmm_ptr;
@@ -145,15 +142,17 @@ void usage() {
   fprintf(stderr,
        "fluxcap version " FLUXCAP_VERSION "\n"
        "\n"
-       "usage: %s [-tx|-rx|-cr|-T|-F|-m] [options] <ring>\n"
+       "usage: %s [-tx|-rx|-cr|-T|-io|-F|-m] [options] <ring>\n"
        "\n"
        " transmit:       -tx -i <eth>  <ring>\n"
        " receive:        -rx -i <eth>  <ring>\n"
-       " create ring:    -cr -s <size> <ring> ...\n"
+       " create:         -cr -s <size> [-k] <ring> ...\n"
+       " i/o rates:      -io <ring> ...\n"
        " tee-out:        -T <src-ring> <dst-ring> ...\n"
        " funnel-in:      -F <dst-ring> <src-ring> ...\n"
        "\n"
        "  <size> may have k/m/g/t suffix\n"
+       "  -k (create mode) keeps ring if already exists\n"
        "\n"
        "GRE encapsulation modes (tx-only):\n"
        "\n"
@@ -611,48 +610,279 @@ ssize_t bb_write(struct shr *s, struct bb *b, char *buf, size_t len) {
   return (rc < 0) ? (ssize_t)-1 : len;
 }
 
-/* work we do on epoll timeout and also at 1hz.
- *  the modes that use the batch buffer to reduce shr_write get periodically
- *  flushed when they fill up or in this function which is a rainy day flush
+/* add rx drops to the counter in the ring app data */
+int update_rx_drops(void) {
+  struct fluxcap_stats st;
+  size_t st_sz;
+  void *stp;
+  int sc, rc = -1;
+
+  stp = &st;
+  st_sz = sizeof(st);
+
+  sc = shr_appdata(cfg.ring, &stp, NULL, &st_sz); /* "get" */
+  if (sc < 0) {
+    fprintf(stderr, "shr_appdata: error %d\n", sc);
+    goto done;
+  }
+
+  st.rx_drops += cfg.stats.rx_drops;
+  cfg.stats.rx_drops = 0;
+
+  sc = shr_appdata(cfg.ring, NULL, stp, &st_sz); /* "set" */
+  if (sc < 0) {
+    fprintf(stderr, "shr_appdata: error %d\n", sc);
+    goto done;
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
+/* add ring read drops to the counter in the ring app data */
+int update_rd_drops(void) {
+  struct fluxcap_stats st;
+  size_t st_sz;
+  void *stp;
+  int sc, rc = -1;
+
+  stp = &st;
+  st_sz = sizeof(st);
+
+  sc = shr_appdata(cfg.ring, &stp, NULL, &st_sz); /* "get" */
+  if (sc < 0) {
+    fprintf(stderr, "shr_appdata: error %d\n", sc);
+    goto done;
+  }
+
+  st.rd_drops += shr_fan_stat(cfg.ring, 1);
+
+  sc = shr_appdata(cfg.ring, NULL, stp, &st_sz); /* "set" */
+  if (sc < 0) {
+    fprintf(stderr, "shr_appdata: error %d\n", sc);
+    goto done;
+  }
+ 
+  rc = 0;
+
+ done:
+  return rc;
+}
+
+/*
+ * flux_log10
+ * 
+ * compute floor of the base-10 log of x
+ * an integer approximation without -lm
+ * 
+ *
  */
-int periodic_work(void) {
+unsigned flux_log10( unsigned x ) {
+  if (x == 0) return 0;
+  unsigned long n = 0;
+  unsigned long m = 10;
+  while(n <= 10) {
+    if (x < m) return n;
+    m *= 10;
+    n++;
+  }
+  /* (2^32 > 10^9) && (2^32 < 10^10)
+     thus log10 of 2^32 is between 9 and 10
+     thus floor(log10(2^32)) is 9
+   */
+  assert(0); 
+}
+
+/* returns volatile memory - use immediately or copy.
+ * takes bits-per-second as input, returns like "20 Mbit/s"
+ * where "bit" is the unit, can also be "pkt" etc.
+ * using whatever SI unit is most readable (K,M,G,T) 
+ */
+char *format_rate(unsigned long bps, char *unit) {
+  double b = bps;
+  char c = ' ';
+  if (b > 1024) { b /= 1024; c = 'K'; }
+  if (b > 1024) { b /= 1024; c = 'M'; }
+  if (b > 1024) { b /= 1024; c = 'G'; }
+  if (b > 1024) { b /= 1024; c = 'T'; }
+  utstring_clear(cfg.tmp);
+  utstring_printf(cfg.tmp, "%10.2f %c%s/s", b, c, unit);
+  return utstring_body(cfg.tmp);
+}
+
+/*
+ * status_rings
+ *
+ * update i/o metrics for each ring
+ *
+ */
+int status_rings(void) {
+  unsigned long start_tick, st, ct;
+  struct shr_stat *ss;
+  double elapsed_sec;
+  size_t sz, nring;
+  int rc = -1, sc;
+  char *name, *c;
+  struct shr **r;
+  struct ww *w;
+  UT_string *s;
+  ssize_t nr;
+  void *fs;
+
+  nring = utvector_len(cfg.aux_rings);
+  struct iovec wiov[nring], *iov;
+
+  /* go through the rings to obtain their in/out counters */
+  s = NULL;
+  r = NULL;
+  w = NULL;
+  iov = wiov;
+  while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
+    s = (UT_string*)utvector_next(cfg.aux_names, s);
+    w = (struct ww*)utvector_next(cfg.watch_win, w);
+    assert(s);
+    assert(w);
+
+    name = utstring_body(s);
+
+    ss = &w->win[ cfg.ticks % NWIN ].ss;
+    sc = shr_stat(*r, ss, NULL);
+    if (sc < 0) goto done;
+
+    fs = &w->win[ cfg.ticks % NWIN ].fs;
+    sz = sizeof(struct fluxcap_stats);
+    sc = shr_appdata(*r, &fs, NULL, &sz);
+    if (sc < 0) {
+      fprintf(stderr, "shr_appdata: error %d\n", sc);
+      goto done;
+    }
+
+    /* for this ring, compute intake & drops over the windows */
+    start_tick = (cfg.ticks < NWIN) ? 0 : (cfg.ticks - (NWIN - 1));
+    st = start_tick % NWIN;
+    ct = cfg.ticks  % NWIN;
+    w->bw = w->win[ ct ].ss.bw -
+            w->win[ st ].ss.bw;
+    w->mw = w->win[ ct ].ss.mw -
+            w->win[ st ].ss.mw;
+    w->rx = w->win[ ct ].fs.rx_drops -
+            w->win[ st ].fs.rx_drops;
+    w->rd = w->win[ ct ].fs.rd_drops -
+            w->win[ st ].fs.rd_drops;
+
+    /* compute per second rates, log and strings */
+    elapsed_sec = (cfg.ticks - start_tick) * 1.0 / TIMER_HZ;
+    memset( &w->ps, 0, sizeof(w->ps) );
+    if (elapsed_sec > 0) {
+      w->ps.p = w->mw / elapsed_sec;
+      w->ps.B = w->bw / elapsed_sec;
+      w->ps.b = w->ps.B * 8;
+      w->ps.lg10_b = flux_log10( w->ps.b );
+      w->ps.rx = w->rx / elapsed_sec;
+      w->ps.rd = w->rd / elapsed_sec;
+    }
+
+    /* render strings */
+    strncpy(w->name, name, NAME_MAX);
+    w->name[NAME_MAX - 1] = '\0';
+    snprintf(w->ps.str.p,  RATE_MAX, "%lu", w->ps.p);
+    snprintf(w->ps.str.B,  RATE_MAX, "%lu", w->ps.B);
+    snprintf(w->ps.str.b,  RATE_MAX, "%lu", w->ps.b);
+    snprintf(w->ps.str.rx, RATE_MAX, "%lu", w->ps.rx);
+    snprintf(w->ps.str.rd, RATE_MAX, "%lu", w->ps.rd);
+
+    /* bits/s in */
+    c = format_rate(w->ps.b, "bit");
+		assert(strlen(c)+1 <= RATE_MAX);
+		strncpy(w->ps.str.E, c, RATE_MAX);
+
+    /* packets/s in */
+    c = format_rate(w->ps.p, "pkt");
+		assert(strlen(c)+1 <= RATE_MAX);
+		strncpy(w->ps.str.P, c, RATE_MAX);
+
+    /* rx (ingest) drops/s */
+    c = format_rate(w->ps.rx, "bit");
+		assert(strlen(c)+1 <= RATE_MAX);
+		strncpy(w->ps.str.X, c, RATE_MAX);
+
+    /* rd (reader) drops/s */
+    c = format_rate(w->ps.rd, "bit");
+		assert(strlen(c)+1 <= RATE_MAX);
+		strncpy(w->ps.str.D, c, RATE_MAX);
+
+    iov->iov_base = w;
+    iov->iov_len = sizeof(*w);
+    iov++;
+  }
+
+  nr = shr_writev(cfg.ring, wiov, nring);
+  if (nr < 0) {
+    fprintf(stderr, "shr_writev: %zd\n", nr);
+    goto done;
+  }
+
+  sc = display_rates(&cfg.ui, wiov, nring);
+  if (sc < 0) goto done;
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
+/*  work we do at 10hz
+ *
+ *  normally nexp (number of expirations) is 1.
+ *  in a busy process expirations may coalesce.
+ *
+ *  we do "rainy day" cache flushes below
+ *  so that time, like capacity, induce flush
+ */
+int timer_work(unsigned long nexp) {
+  int rc = -1, sc;
   struct shr **r;
   struct bb *b;
-  int rc = -1;
 
   switch(cfg.mode) {
+
     case mode_tee:
       r = NULL;
       b = NULL;
-      while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r)) != NULL) {
+      while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
         b = (struct bb*)utvector_next(cfg.tee_bb, b); 
         assert(b);
-        if (bb_flush(*r, b) < 0) goto done;
+        sc = bb_flush(*r, b);
+        if (sc < 0) goto done;
       }
-
+      sc = update_rd_drops();
+      if (sc < 0) goto done;
       break;
+
+    case mode_transmit:
+      sc = update_rd_drops();
+      if (sc < 0) goto done;
+      break;
+
     case mode_receive:
-      if (cfg.losing) {
-        fprintf(stderr,"packets lost\n");
-        cfg.losing = 0;
-      }
-      struct tpacket_stats stats;  /* see /usr/include/linux/if_packet.h */
-      socklen_t len = sizeof(stats);
-
-      int ec = getsockopt(cfg.fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
-      if (ec < 0) {
-        fprintf(stderr,"getsockopt PACKET_STATISTICS: %s\n", strerror(errno));
-        goto done;
-      }
-
-      if (cfg.verbose) {
-        fprintf(stderr, "Received packets: %u\n", stats.tp_packets);
-        fprintf(stderr, "Dropped packets:  %u\n", stats.tp_drops);
-      }
-      /* FALL THROUGH */
-    case mode_funnel:
-      if (bb_flush(cfg.ring, &cfg.bb) < 0) goto done;
+      sc = bb_flush(cfg.ring, &cfg.bb);
+      if (sc < 0) goto done;
+      sc = update_rx_drops();
+      if (sc < 0) goto done;
       break;
+
+    case mode_funnel:
+      sc = bb_flush(cfg.ring, &cfg.bb);
+      if (sc < 0) goto done;
+      break;
+
+    case mode_watch:
+      sc = status_rings();
+      if (sc < 0) goto done;
+      break;
+
     default:
       break;
   }
@@ -663,20 +893,64 @@ int periodic_work(void) {
   return rc;
 }
 
+/* retrieve packet statistics from the kernel
+ * see /usr/include/linux/if_packet.h
+ */
+int show_stats(void) {
+  struct tpacket_stats stats;
+  int sc;
+
+  if (cfg.mode != mode_receive) return 0;
+
+  socklen_t len = sizeof(stats);
+  sc = getsockopt(cfg.fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
+  if (sc < 0) {
+    fprintf(stderr,"getsockopt: %s\n", strerror(errno));
+    return -1;
+  }
+
+  fprintf(stderr, "Received packets: %u\n", stats.tp_packets);
+  fprintf(stderr, "Dropped packets:  %u\n", stats.tp_drops);
+  return 0;
+}
+
+int handle_stdin(void) {
+  int rc = -1;
+  ssize_t nr;
+  char c;
+
+  assert(cfg.mode == mode_watch);
+
+  nr = read(STDIN_FILENO, &c, sizeof(c));
+  if (nr < 0) {
+    fprintf(stderr, "read: %s\n", strerror(errno));
+    goto done;
+  }
+
+  if (c == 'q') goto done;
+  if (c == ' ') goto done;
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
 int handle_signal(void) {
-  int rc=-1;
   struct signalfd_siginfo info;
+  ssize_t nr;
+  int rc=-1;
   
-  if (read(cfg.signal_fd, &info, sizeof(info)) != sizeof(info)) {
+  nr = read(cfg.signal_fd, &info, sizeof(info));
+  if (nr != sizeof(info)) {
     fprintf(stderr,"failed to read signal fd buffer\n");
     goto done;
   }
 
   switch(info.ssi_signo) {
     case SIGALRM: 
-      cfg.ticks++;
       gettimeofday(&cfg.now, NULL);
-      if (periodic_work() < 0) goto done;
+      if (cfg.verbose) show_stats();
       alarm(1); 
       break;
     default: 
@@ -684,6 +958,36 @@ int handle_signal(void) {
       goto done;
       break;
   }
+
+ rc = 0;
+
+ done:
+  return rc;
+}
+
+
+/*
+ * handle_timer
+ *
+ * triggered when our timerfd periodically expires.
+ * number of expirations is usually 1, but in a very
+ * busy process multiple expirations can coalesce.
+ *
+ */
+int handle_timer(void) {
+  unsigned long nexp;
+  int rc=-1, sc;
+ 
+  sc = read(cfg.timer_fd, &nexp, sizeof(nexp));
+  if (sc < 0) {
+    fprintf(stderr,"read: %s\n", strerror(errno));
+    goto done;
+  }
+
+  sc = timer_work(nexp);
+  if (sc < 0) goto done;
+
+  cfg.ticks++;
 
  rc = 0;
 
@@ -852,7 +1156,7 @@ int tee_packet(void) {
 
     r = NULL;
     b = NULL;
-    while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r)) != NULL) {
+    while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
       b = (struct bb*)utvector_next(cfg.tee_bb, b); 
       assert(b);
 
@@ -1129,7 +1433,7 @@ int receive_packets(void) {
     if ((hdr->tp_status & TP_STATUS_USER) == 0) break;
 
     /* note packet drop condition */
-    if (hdr->tp_status & TP_STATUS_LOSING) cfg.losing=1;
+    if (hdr->tp_status & TP_STATUS_LOSING) cfg.stats.rx_drops++;
 
     tx = cur + hdr->tp_mac;
     nx = hdr->tp_snaplen;
@@ -1253,7 +1557,7 @@ int handle_io(void) {
 /* test if fd is a funnel source */
 int is_funnel(int fd, int *opos) {
   int *p = NULL, pos=0;
-  while ( (p = utvector_next(cfg.aux_fd, p)) != NULL) {
+  while ( (p = utvector_next(cfg.aux_fd, p))) {
     if (*p == fd) {
       *opos = pos;
       return 1;
@@ -1315,23 +1619,25 @@ int parse_encap(char *opt) {
 }
 
 int main(int argc, char *argv[]) {
+  int rc = -1, n, opt, ring_mode, init_mode, pos, sc;
   struct epoll_event ev;
   cfg.prog = argv[0];
-  int rc = -1, n, opt, ring_mode, init_mode, pos, ec;
-  char *file;
   struct shr *r;
   struct bb *b;
+  char *file;
   void **p;
 
   cfg.aux_rings = utvector_new(utmm_ptr);
   cfg.aux_names = utvector_new(utstring_mm);
+  cfg.tmp_files = utvector_new(utstring_mm);
   cfg.aux_fd = utvector_new(utmm_int);
   cfg.tee_bb = utvector_new(&bb_mm);
+  cfg.watch_win = utvector_new(&ww_mm);
   utstring_new(cfg.tmp);
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KRq")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KRqk")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
@@ -1340,11 +1646,10 @@ int main(int argc, char *argv[]) {
       case 'F': cfg.mode = mode_funnel; break;
       case 'E': cfg.encap.enable=1; if (parse_encap(optarg)) usage(); break;
       case 'v': cfg.verbose++; break;
+      case 'k': cfg.keep=1; break;
       case 'V': cfg.vlan=atoi(optarg); break; 
       case 'D': cfg.tail=atoi(optarg); break; 
       case 's': cfg.size = kmgt(optarg); break;
-      case 'i': if (strlen(optarg) < MAX_NIC) strncpy(cfg.dev, optarg, MAX_NIC);
-                break;
       case 'B': cfg.ring_block_nr=atoi(optarg); break;
       case 'S': cfg.ring_block_sz = 1 << (unsigned)atoi(optarg); break;
       case 'Z': cfg.ring_frame_sz=atoi(optarg); break;
@@ -1353,6 +1658,12 @@ int main(int argc, char *argv[]) {
       case 'd': cfg.drop_pct=100-atoi(optarg); break;
       case 'K': cfg.keep_going_on_tx_err = 1; break;
       case 'R': cfg.use_tx_ring = 1; break;
+      case 'i': if (!strcmp(optarg, "o")) cfg.mode = mode_watch; /* -io */
+                else {                                           /* -i <nic> */
+                  if (strlen(optarg)+1 > MAX_NIC) goto done;
+                  strncpy(cfg.dev, optarg, MAX_NIC);
+                }
+                break;
       case 'h': default: usage(); break;
     }
   }
@@ -1374,6 +1685,21 @@ int main(int argc, char *argv[]) {
     fprintf(stderr,"signalfd: %s\n", strerror(errno));
     goto done;
   }
+
+  /* create the timerfd for receiving clock events */
+  cfg.timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+  if (cfg.timer_fd == -1) {
+    fprintf(stderr,"timerfd_create: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* set up for periodic timer expiration */
+  sc = timerfd_settime(cfg.timer_fd, 0, &cfg.timer, NULL);
+  if (sc < 0) {
+    fprintf(stderr, "timerfd_settime: %s\n", strerror(errno));
+    goto done;
+  }
+
   /* set up the epoll instance */
   cfg.epoll_fd = epoll_create(1); 
   if (cfg.epoll_fd == -1) {
@@ -1382,8 +1708,11 @@ int main(int argc, char *argv[]) {
   }
 
   /* add descriptors of interest */
-  if (new_epoll(EPOLLIN, cfg.signal_fd)) goto done; // signals
-
+  if (new_epoll(EPOLLIN, cfg.signal_fd)) goto done;
+  if (new_epoll(EPOLLIN, cfg.timer_fd))  goto done;
+  if (cfg.mode == mode_watch && isatty(STDIN_FILENO)) {
+   if (new_epoll(EPOLLIN, STDIN_FILENO)) goto done;
+  }
 
   /* in transmit mode, epoll on the ring descriptor.
    * in receive mode, epoll on the raw socket.
@@ -1445,12 +1774,38 @@ int main(int argc, char *argv[]) {
       if (cfg.size == 0) usage();
       while (optind < argc) {
         file = argv[optind++];
-        init_mode = SHR_KEEPEXIST|SHR_DROP;
+        init_mode = SHR_DROP|SHR_FAN|SHR_APPDATA;
+        if (cfg.keep) init_mode |= SHR_KEEPEXIST;
         if (cfg.verbose) fprintf(stderr,"creating %s\n", file);
-        if (shr_init(file, cfg.size, init_mode) < 0) goto done;
+        sc = shr_init(file, cfg.size, init_mode, &cfg.stats, sizeof(cfg.stats));
+        if (sc < 0) goto done;
       }
       rc = 0;
       goto done;
+      break;
+    case mode_watch:
+      while (optind < argc) {
+        file = argv[optind++];
+        utstring_clear(cfg.tmp);
+        utstring_printf(cfg.tmp, "%s", file);
+        utvector_push(cfg.aux_names, cfg.tmp);
+        r = shr_open(file, SHR_RDONLY);
+        if (r == NULL) goto done;
+        utvector_push(cfg.aux_rings, &r);
+        utvector_extend(cfg.watch_win);
+      }
+      utstring_clear(cfg.tmp);
+      utstring_printf(cfg.tmp, "/dev/shm/stat.%u", (int)getpid());
+      file = utstring_body(cfg.tmp);
+      init_mode = SHR_DROP|SHR_FAN;
+      cfg.size = utvector_len(cfg.watch_win) * 
+                 (sizeof(size_t) + sizeof(struct ww));
+      sc = shr_init(file, cfg.size, init_mode);
+      if (sc < 0) goto done;
+      utvector_push(cfg.tmp_files, cfg.tmp);
+      cfg.ring = shr_open(file, SHR_WRONLY);
+      if (cfg.ring == NULL) goto done;
+      if (init_watch_ui(&cfg.ui) < 0) goto done;
       break;
     default:
       usage();
@@ -1460,17 +1815,18 @@ int main(int argc, char *argv[]) {
   alarm(1);
 
   while (1) {
-    ec = epoll_wait(cfg.epoll_fd, &ev, 1, 100);
-    if (ec < 0) { 
+    sc = epoll_wait(cfg.epoll_fd, &ev, 1, -1);
+    if (sc < 0) {
       fprintf(stderr, "epoll: %s\n", strerror(errno));
       goto done;
     }
 
-    if (ec == 0)                          { if (periodic_work() < 0) goto done; }
-    else if (ev.data.fd == cfg.signal_fd) { if (handle_signal()  < 0) goto done; }
+    if (sc == 0) { assert(0); goto done; }
+    else if (ev.data.fd == cfg.signal_fd) { if (handle_signal() < 0) goto done;}
+    else if (ev.data.fd == STDIN_FILENO)  { if (handle_stdin()  < 0) goto done;}
+    else if (ev.data.fd == cfg.timer_fd)  { if (handle_timer()  < 0) goto done;}
     else if (ev.data.fd == cfg.fd)        { if (handle_io() < 0) goto done; }
     else if (is_funnel(ev.data.fd, &pos)) { if (funnel(pos) < 0) goto done; }
-
   }
   
   rc = 0;
@@ -1482,6 +1838,7 @@ done:
   }
   if (cfg.tx_fd != -1) close(cfg.tx_fd);
   if (cfg.signal_fd != -1) close(cfg.signal_fd);
+  if (cfg.timer_fd != -1) close(cfg.timer_fd);
   if (cfg.epoll_fd != -1) close(cfg.epoll_fd);
   utmm_fini(&bb_mm, &cfg.bb, 1);
   utmm_fini(&bb_mm, &cfg.rb, 1);
@@ -1490,11 +1847,18 @@ done:
     assert(cfg.pb.iov == NULL); /* iov part of pb unused */
   }
   if (cfg.ring) shr_close(cfg.ring);
-  p = NULL; while ( (p = utvector_next(cfg.aux_rings, p)) != NULL) shr_close(*p);
+  p = NULL;
+  while ( (p = utvector_next(cfg.aux_rings, p))) shr_close(*p);
   utvector_free(cfg.aux_rings);
   utvector_free(cfg.aux_names);
+  while ( (p = utvector_next(cfg.tmp_files, p))) unlink(*p);
+  utvector_free(cfg.tmp_files);
   utvector_free(cfg.aux_fd);
   utstring_free(cfg.tmp);
   utvector_free(cfg.tee_bb);
+  utvector_free(cfg.watch_win);
+  if (cfg.mode == mode_watch) {
+     fini_watch_ui(&cfg.ui);
+  }
   return rc;
 }
