@@ -927,6 +927,7 @@ int handle_stdin(void) {
     goto done;
   }
 
+  if (c == 'u') cfg.ui.unit = !cfg.ui.unit;
   if (c == 'q') goto done;
   if (c == ' ') goto done;
 

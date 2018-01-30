@@ -49,6 +49,7 @@ int want_keys(int want_keystrokes) {
 
 int init_watch_ui(struct watch_ui *ui) {
   int rc  = -1;
+  char *term;
   size_t l;
 
   if (want_keys(1) < 0) goto done;
@@ -60,6 +61,13 @@ int init_watch_ui(struct watch_ui *ui) {
   l = strlen(ui->title);
   if (sizeof(ui->title) - l >= 20)
     strcat(ui->title, " Intake Monitor");
+
+  /* acs characters for nice looking bars.
+     putty often identifies as an xterm,
+     render poorly, unless under screen */
+  term = getenv("TERM");
+  ui->acs = (term && strcmp(term, "xterm")) ? 1 : 0;
+  ui->acs += getenv("STY") ? 1 : 0;
 
   rc = 0;
 
@@ -89,10 +97,18 @@ int fini_watch_ui(struct watch_ui *ui) {
  *
  */
 #define BARW 16
-int bar(unsigned row, unsigned col, unsigned level) {
+int bar(struct watch_ui *ui, unsigned row, unsigned col, unsigned level) {
   unsigned i, r,c;
   unsigned long b;
   int rc = -1;
+
+  unsigned long ul, vl, ur, ll, lr, hl;
+  ul = ui->acs ? ACS_ULCORNER : ' ';
+  vl = ui->acs ? ACS_VLINE    : ' ';
+  ur = ui->acs ? ACS_URCORNER : ' ';
+  ll = ui->acs ? ACS_LLCORNER : ' ';
+  lr = ui->acs ? ACS_LRCORNER : ' ';
+  hl = ui->acs ? ACS_HLINE    : ' ';
 
   if (level > 12) level = 12;
 
@@ -100,24 +116,24 @@ int bar(unsigned row, unsigned col, unsigned level) {
   c = col;
 
   /* top border */
-  mvaddch(r, c, ACS_ULCORNER);
-  for(i=1; i < BARW; i++) mvaddch(r, c+i, ACS_HLINE);
-  mvaddch(r, c+BARW, ACS_URCORNER);
+  mvaddch(r, c, ul);
+  for(i=1; i < BARW; i++) mvaddch(r, c+i, hl);
+  mvaddch(r, c+BARW, ur);
 
   /* central row */
   r++;
-  mvaddch(r, c, ACS_VLINE);
+  mvaddch(r, c, vl);
   b = ' ';
   b |= A_STANDOUT;
   b |= COLOR_PAIR(3);
   for(i=1; i < level+1; i++) mvaddch(r, c+i, b);
-  mvaddch(r, c+BARW, ACS_VLINE);
+  mvaddch(r, c+BARW, vl);
 
   /* bottom border */
   r++;
-  mvaddch(r, c, ACS_LLCORNER);
-  for(i=1; i < BARW; i++) mvaddch(r, c+i, ACS_HLINE);
-  mvaddch(r, c+BARW, ACS_LRCORNER);
+  mvaddch(r, c, ll);
+  for(i=1; i < BARW; i++) mvaddch(r, c+i, hl);
+  mvaddch(r, c+BARW, lr);
 
   rc = 0;
 
@@ -132,10 +148,10 @@ int bar(unsigned row, unsigned col, unsigned level) {
  *
  */
 int display_rates(struct watch_ui *ui, struct iovec *wiov, size_t niov) {
-  int rc = -1, loss;
+  int rc = -1, rx_loss, rd_loss;
   struct ww *w;
   size_t n, l;
-  unsigned row, col;
+  unsigned row, col, r;
   unsigned long c;
 
   clear();
@@ -148,17 +164,17 @@ int display_rates(struct watch_ui *ui, struct iovec *wiov, size_t niov) {
   attrset(A_ITALIC | A_BOLD | COLOR_PAIR(3) );
   mvprintw(row, col, ui->title);
   attrset(0);
-  row += 2;
+  row += 3;
 
   for(n=0; n < niov; n++) {
 
-    if (row + 3 > ui->rows) break;
+    if (row + 4 > ui->rows) break;
 
     w = (struct ww*)(wiov[n].iov_base);
 
     /* bar */
     attrset(A_BOLD | COLOR_PAIR(3) );
-    col = 0;  bar(row-1, col+1, w->ps.lg10_b);
+    col = 0;  bar(ui, row-1, col+1, w->ps.lg10_b);
 
     /* name */
     attrset(A_ITALIC | A_BOLD | COLOR_PAIR(5) );
@@ -166,17 +182,26 @@ int display_rates(struct watch_ui *ui, struct iovec *wiov, size_t niov) {
 
     /* rates */
     attrset(A_BOLD);
-    col = 40; mvprintw(row, col, w->ps.str.E);
-    col = 60; mvprintw(row, col, w->ps.str.P);
-
+    col = 40; mvprintw(row, col, (ui->unit == rate_bps) ? 
+                                  w->ps.str.E : 
+                                  w->ps.str.P );
     /* drops */
     attrset(A_BOLD | COLOR_PAIR(2) );
-    loss = ( w->ps.rx || w->ps.rd );
-    col = 20; if (loss) mvprintw(row+1, col, "rx/rd loss");
-    col = 40; if (loss) mvprintw(row+1, col, w->ps.str.X);
-    col = 60; if (loss) mvprintw(row+1, col, w->ps.str.D);
+    rx_loss = w->ps.rx;
+    rd_loss = w->ps.rd;
+    r = row;
+    if (rx_loss) {
+      r++;
+      col = 20; mvprintw(r, col, "rx loss");
+      col = 40; mvprintw(r, col, w->ps.str.X);
+    }
+    if (rd_loss) {
+      r++;
+      col = 20; mvprintw(r, col, "lag loss");
+      col = 40; mvprintw(r, col, w->ps.str.D);
+    }
 
-    row += 3;
+    row += 4;
   }
 
   refresh();

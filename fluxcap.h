@@ -50,10 +50,12 @@ struct fluxcap_stats {
   size_t rd_drops;  /* mode_transmit/tee drops due to reader lag on shr ring */
 };
 
-struct watch_ui {
+struct watch_ui {  /* helper structure for ui state in mode_watch */
   char title[80];
   int rows;
   int cols;
+  enum { rate_bps=0, rate_pps } unit;
+  int acs;
 };
 
 /* watch window - for tracking rates over NWIN observations */
