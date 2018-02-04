@@ -161,7 +161,7 @@ int display_rates(struct watch_ui *ui, struct iovec *wiov, size_t niov) {
   /* title text */
   l = strlen(ui->title);
   col = (80-l)/2;
-  attrset(A_ITALIC | A_BOLD | COLOR_PAIR(3) );
+  attrset( A_BOLD | COLOR_PAIR(3) );
   mvprintw(row, col, ui->title);
   attrset(0);
   row += 3;
@@ -177,7 +177,7 @@ int display_rates(struct watch_ui *ui, struct iovec *wiov, size_t niov) {
     col = 0;  bar(ui, row-1, col+1, w->ps.lg10_b);
 
     /* name */
-    attrset(A_ITALIC | A_BOLD | COLOR_PAIR(5) );
+    attrset( A_BOLD | COLOR_PAIR(5) );
     col = 20; mvprintw(row, col, w->name);
 
     /* rates */
