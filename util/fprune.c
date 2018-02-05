@@ -68,6 +68,8 @@ struct {
   int verbose;
   int walk;         /* walk (tree scan) mode */
   int walk_prune;   /* prune empty dirs in walk */
+  int unsorted;     /* whether to mtime-sort files */
+  size_t count;     /* count of files read on ring */
   int pct;          /* percent to prune at */
   int epoll_fd;     /* epoll descriptor */
   int signal_fd;    /* to receive signals */
@@ -131,6 +133,7 @@ void usage() {
                  "   -t <tb>            [assume <tb> terabyte filesystem]\n"
                  "   -N <nfiles-per-tb> [assume <n> files per terabyte]\n"
                  "   -v                 [verbose; repeatable]\n"
+                 "   -u                 [skip stat/sort; use ring order]\n"
                  "   -w                 [walk mode; walk tree rooted at dir]\n"
                  "   -P                 [walk mode; prune empty directories]\n"
                  "   -h                 [this help]\n"
@@ -418,7 +421,7 @@ int add(char *file) {
     goto done;
   }
 
-  sc = stat(cfg.tmp, &s);
+  sc = cfg.unsorted ? 0 : stat(cfg.tmp, &s);
   if (sc < 0) {
     fprintf(stderr, "stat: %s: %s\n", cfg.tmp, strerror(errno));
     goto done;
@@ -434,7 +437,8 @@ int add(char *file) {
     goto done;
   }
 
-  mtime = s.st_mtim.tv_sec;
+  mtime = cfg.unsorted ? (time_t)cfg.count : s.st_mtim.tv_sec;
+  cfg.count++;
 
   /* is item already in hash table? */
   HASH_FIND_STR(cfg.fe_tree, cfg.tmp, fe);
@@ -460,7 +464,11 @@ int add(char *file) {
   assert(fe);
   memcpy(fe->path, cfg.tmp, l+1);
   fe->mtime = mtime;
-  HASH_ADD_INORDER(hh, cfg.fe_tree, path, l, fe, age_sort);
+  if (cfg.unsorted) {
+    HASH_ADD(hh, cfg.fe_tree, path, l, fe);
+  } else {
+    HASH_ADD_INORDER(hh, cfg.fe_tree, path, l, fe, age_sort);
+  }
 
   rc = 0;
 
@@ -567,6 +575,13 @@ int open_table(void) {
   return rc;
 }
 
+
+int fstrcmp(const void *_a, const void *_b) {
+	char *a = *(char **)_a;
+	char *b = *(char **)_b;
+  return strcmp(a,b);
+}
+
 /* add directory to tree, recursively. 
  * recursion depth bounded by fs depth
  *
@@ -583,6 +598,9 @@ int walk_tree(char *dir) {
   ssize_t nr;
   DIR *d = NULL;
 
+  size_t num_slots=0, num_used=0, num_wanted, slotn;
+  char **slots=NULL, **stmp, *dname;
+
   l = strlen(dir);
   d = opendir(dir);
   if (d == NULL) {
@@ -590,23 +608,47 @@ int walk_tree(char *dir) {
     goto done;
   }
 
-  /* iterate over directory contents. use stat to distinguish regular files
-   * from directories (etc). stat is more robust than using dent->d_type */
+  /* accumulate directory entries into temp array to sort */
   while ( (dent = readdir(d)) != NULL) {
-
     /* skip the . and .. directories */
     if (!strcmp(dent->d_name, "."))  continue;
     if (!strcmp(dent->d_name, "..")) continue;
+    if (num_slots - num_used == 0) {
+      num_wanted = num_slots ? (num_slots * 2) : 100;
+      stmp = realloc( slots, num_wanted * sizeof(char*));
+      if (stmp == NULL) {
+        fprintf(stderr, "out of memory\n");
+        goto done;
+      }
+      slots = stmp;
+      num_slots = num_wanted;
+    }
+    assert(num_slots > num_used);
+    slots[num_used] = strdup(dent->d_name);
+    if (slots[num_used] == NULL) {
+      fprintf(stderr, "out of memory\n");
+      goto done;
+    }
+    num_used++;
+  }
+
+  /* this is the heart of the sorted directory listing */
+  qsort(slots, num_used, sizeof(char*), fstrcmp);
+
+  /* iterate over sorted array */
+  for(slotn = 0; slotn < num_used; slotn++) {
+
+    dname = slots[ slotn ];
 
     /* formulate path to dir entry */
-    el = strlen(dent->d_name);
+    el = strlen(dname);
     if (l+1+el+1 > PATH_MAX) {
-      fprintf(stderr, "path too long: %s/%s\n", dir, dent->d_name);
+      fprintf(stderr, "path too long: %s/%s\n", dir, dname);
       goto done;
     }
     memcpy(path, dir, l);
     path[l] = '/';
-    memcpy(&path[l+1], dent->d_name, el+1);
+    memcpy(&path[l+1], dname, el+1);
 
     /* lstat to determine its type */
     sc = lstat(path, &s);
@@ -619,12 +661,10 @@ int walk_tree(char *dir) {
       f = walk_tree(path);
       if (f < 0) goto done;
       if (f == 0) {
-        if (cfg.walk_prune) {
-          sc = rmdir(path);
-          if (sc < 0) {
-            fprintf(stderr, "rmdir: %s\n", strerror(errno));
-            goto done;
-          }
+        sc = cfg.walk_prune ? rmdir(path) : 0;
+        if (sc < 0) {
+          fprintf(stderr, "rmdir: %s\n", strerror(errno));
+          goto done;
         }
       }
       if (f > 0) n++;
@@ -645,6 +685,10 @@ int walk_tree(char *dir) {
   rc = 0;
 
  done:
+  if (slots) {
+    for(slotn=0; slotn < num_used; slotn++) free( slots[slotn] );
+    free(slots);
+  }
   if (d) closedir(d);
   return rc ? rc : n;
 }
@@ -657,7 +701,7 @@ int main(int argc, char *argv[]) {
   char *dir=NULL;
   size_t n;
 
-  while ( (opt = getopt(argc,argv,"vwPr:p:d:hb:N:")) > 0) {
+  while ( (opt = getopt(argc,argv,"vwPr:p:d:hb:N:u")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'r': cfg.ring_name = strdup(optarg); break;
@@ -666,6 +710,7 @@ int main(int argc, char *argv[]) {
       case 'b': cfg.table_file = strdup(optarg); break;
       case 'N': cfg.nfile_per_tb = atoi(optarg); break;
       case 'w': cfg.walk = 1; break;
+      case 'u': cfg.unsorted = 1; break;
       case 'P': cfg.walk_prune = 1; break;
       case 'h': default: usage(); break;
     }
