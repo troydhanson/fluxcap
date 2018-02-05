@@ -698,13 +698,14 @@ int main(int argc, char *argv[]) {
   char *dir=NULL;
   size_t n;
 
-  while ( (opt = getopt(argc,argv,"vwPr:p:d:hb:N:uW")) > 0) {
+  while ( (opt = getopt(argc,argv,"vwPr:p:d:hb:N:t:uW")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'r': cfg.ring_name = strdup(optarg); break;
       case 'p': cfg.pct = atoi(optarg); break;
       case 'd': dir = strdup(optarg); break;
       case 'b': cfg.table_file = strdup(optarg); break;
+      case 't': cfg.tb = atoi(optarg); break;
       case 'N': cfg.nfile_per_tb = atoi(optarg); break;
       case 'w': cfg.walk = 1; break;
       case 'W': cfg.fork_walker = 1; break;
