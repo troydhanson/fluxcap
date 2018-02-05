@@ -67,6 +67,7 @@ struct {
   char *prog;
   int verbose;
   int walk;         /* walk (tree scan) mode */
+  int fork_walker;  /* walk mode in sub process */
   int walk_prune;   /* prune empty dirs in walk */
   int unsorted;     /* whether to mtime-sort files */
   size_t count;     /* count of files read on ring */
@@ -116,10 +117,11 @@ void usage() {
                  "(e.g. ffcp) to get notified of files via ring buffer.\n"
                  "Typically the initial filesystem contents are posted\n"
                  "to the ring buffer by running a separate instance of\n"
-                 "this program in -w (walk) mode. Similarly, a program\n"
-                 "such as ffcp, that puts files into the filesystem posts\n"
-                 "them to the ring buffer. This program sorts them by age\n"
-                 "and unlinks them as the filesystems utilization exceeds\n"
+                 "this program in -w (walk) mode; -W forks it implicitly.\n"
+                 "Tools (e.g. ffcp) that put files into the filesystem post\n"
+                 "their names to the ring buffer. This tool sorts them by age\n"
+                 "(or simply by ring arrival order in -u mode) and unlinks\n"
+                 "the oldest files as the filesystems utilization exceeds\n"
                  "the set value. Additionally, a maximum number of files\n"
                  "kept is the product of -t <tb> and -N <nfiles-per-tb>.\n"
                  "\n");
@@ -135,6 +137,7 @@ void usage() {
                  "   -v                 [verbose; repeatable]\n"
                  "   -u                 [skip stat/sort; use ring order]\n"
                  "   -w                 [walk mode; walk tree rooted at dir]\n"
+                 "   -W                 [fork subprocess in walk mode]\n"
                  "   -P                 [walk mode; prune empty directories]\n"
                  "   -h                 [this help]\n"
                  "\n"
@@ -268,9 +271,13 @@ int unlink_path(const char *name, int is_dir) {
 
   ec = is_dir ? rmdir(name) : 
                 unlink(name);
+  /* skip and continue on unlink errors. either we have
+   * a record of file that no longer exists, or we lack
+   * permission, or it's not a regular file, etc. */
   if (ec < 0) {
-    if (errno == ENOENT) rc = 0;
-    else fprintf(stderr, "unlink %s: %s\n", name, strerror(errno));
+    if (errno != ENOENT)
+      fprintf(stderr, "unlink %s: %s\n", name, strerror(errno));
+    rc = 0;
     goto done;
   }
 
@@ -424,16 +431,6 @@ int add(char *file) {
   sc = cfg.unsorted ? 0 : stat(cfg.tmp, &s);
   if (sc < 0) {
     fprintf(stderr, "stat: %s: %s\n", cfg.tmp, strerror(errno));
-    goto done;
-  }
-
-  if (S_ISDIR(s.st_mode)) {
-    rc = 0;
-    goto done;
-  }
-
-  if (S_ISREG(s.st_mode) == 0) {
-    fprintf(stderr, "not a regular file: %s\n", cfg.tmp);
     goto done;
   }
 
@@ -701,7 +698,7 @@ int main(int argc, char *argv[]) {
   char *dir=NULL;
   size_t n;
 
-  while ( (opt = getopt(argc,argv,"vwPr:p:d:hb:N:u")) > 0) {
+  while ( (opt = getopt(argc,argv,"vwPr:p:d:hb:N:uW")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'r': cfg.ring_name = strdup(optarg); break;
@@ -710,6 +707,7 @@ int main(int argc, char *argv[]) {
       case 'b': cfg.table_file = strdup(optarg); break;
       case 'N': cfg.nfile_per_tb = atoi(optarg); break;
       case 'w': cfg.walk = 1; break;
+      case 'W': cfg.fork_walker = 1; break;
       case 'u': cfg.unsorted = 1; break;
       case 'P': cfg.walk_prune = 1; break;
       case 'h': default: usage(); break;
@@ -729,6 +727,23 @@ int main(int argc, char *argv[]) {
   if (is_mountpoint(cfg.dir) <= 0) {
     fprintf(stderr, "not mountpoint: %s\n", cfg.dir);
     goto done;
+  }
+
+  if (cfg.fork_walker) {
+    pid_t pid = fork();
+    if (pid < 0) {
+      fprintf(stderr, "fork: %s\n", strerror(errno));
+      goto done;
+    }
+    if (pid == 0) { /* child */
+      cfg.walk = 1;
+      cfg.walk_prune = 1;
+      if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0) {
+        fprintf(stderr, "prctl: %s\n", strerror(errno));
+        goto done;
+      }
+    }
+    /* child and parent continue */
   }
 
   /* open the ring */
@@ -809,8 +824,8 @@ int main(int argc, char *argv[]) {
   HASH_CLEAR(hh, cfg.fe_tree);
   if (cfg.ring_name) free(cfg.ring_name);
   if (cfg.ring) shr_close(cfg.ring);
-  if (cfg.table_fd) close(cfg.table_fd);
   if (cfg.table) munmap(cfg.table, cfg.table_sz);
+  if (cfg.table_fd  != -1) close(cfg.table_fd);
   if (cfg.signal_fd != -1) close(cfg.signal_fd);
   if (cfg.epoll_fd  != -1) close(cfg.epoll_fd);
   return 0;
