@@ -72,6 +72,7 @@ struct {
   struct fluxcap_stats stats; /* used to periodically update rx/rd stats */
   struct watch_ui ui;  /* in mode_watch, display state */
   int keep; /* in mode_create, keep existing ring if present */
+  int losing;
 } cfg = {
   .bb.n = BATCH_SIZE,
   .rb.n = BATCH_SIZE,
@@ -610,12 +611,35 @@ ssize_t bb_write(struct shr *s, struct bb *b, char *buf, size_t len) {
   return (rc < 0) ? (ssize_t)-1 : len;
 }
 
-/* add rx drops to the counter in the ring app data */
+/* add rx drops to the counter in the ring app data
+ *
+ * see /usr/include/linux/if_packet.h
+ * see packet(7)
+ * "Receiving statistics resets the internal counters."
+ *
+ */
 int update_rx_drops(void) {
+  struct tpacket_stats stats;
   struct fluxcap_stats st;
   size_t st_sz;
   void *stp;
   int sc, rc = -1;
+
+  assert(cfg.mode == mode_receive);
+  if (cfg.losing == 0) return 0;
+
+  /* packet(7): "Receiving statistics resets the internal counters."  */
+  socklen_t len = sizeof(stats);
+  sc = getsockopt(cfg.fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
+  if (sc < 0) {
+    fprintf(stderr,"getsockopt: %s\n", strerror(errno));
+    return -1;
+  }
+
+  if (cfg.verbose) {
+    fprintf(stderr, "Received packets: %u\n", stats.tp_packets);
+    fprintf(stderr, "Dropped packets:  %u\n", stats.tp_drops);
+  }
 
   stp = &st;
   st_sz = sizeof(st);
@@ -626,8 +650,7 @@ int update_rx_drops(void) {
     goto done;
   }
 
-  st.rx_drops += cfg.stats.rx_drops;
-  cfg.stats.rx_drops = 0;
+  st.rx_drops += stats.tp_drops;
 
   sc = shr_appdata(cfg.ring, NULL, stp, &st_sz); /* "set" */
   if (sc < 0) {
@@ -635,6 +658,7 @@ int update_rx_drops(void) {
     goto done;
   }
 
+  cfg.losing = 0;
   rc = 0;
 
  done:
@@ -893,24 +917,8 @@ int timer_work(unsigned long nexp) {
   return rc;
 }
 
-/* retrieve packet statistics from the kernel
- * see /usr/include/linux/if_packet.h
- */
 int show_stats(void) {
-  struct tpacket_stats stats;
-  int sc;
 
-  if (cfg.mode != mode_receive) return 0;
-
-  socklen_t len = sizeof(stats);
-  sc = getsockopt(cfg.fd, SOL_PACKET, PACKET_STATISTICS, &stats, &len);
-  if (sc < 0) {
-    fprintf(stderr,"getsockopt: %s\n", strerror(errno));
-    return -1;
-  }
-
-  fprintf(stderr, "Received packets: %u\n", stats.tp_packets);
-  fprintf(stderr, "Dropped packets:  %u\n", stats.tp_drops);
   return 0;
 }
 
@@ -1434,7 +1442,7 @@ int receive_packets(void) {
     if ((hdr->tp_status & TP_STATUS_USER) == 0) break;
 
     /* note packet drop condition */
-    if (hdr->tp_status & TP_STATUS_LOSING) cfg.stats.rx_drops++;
+    if (hdr->tp_status & TP_STATUS_LOSING) cfg.losing = 1;
 
     tx = cur + hdr->tp_mac;
     nx = hdr->tp_snaplen;
