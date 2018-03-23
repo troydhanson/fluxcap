@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# create a ring
+shr-tool -c -s 1m ring oring
+
+# make test directories
+mkdir -p testdir outdir
+
+# put content into testdir
+tar xf testdir.tar -C testdir
+
+# dump directory contents to ring
+../fwalk -d testdir -r ring
+
+# copy from ring files using naming template
+../ffcp -i ring -o oring -r '(\d{8})/(\w{3})/(.*)$' -t 'outdir/$1/$2.$3' -m -z &
+PID1=$!
+sleep 5
+kill $PID1
+wait $PID1
+
+echo "listing output directory"
+find outdir
+
+echo "listing output ring"
+shr-tool -r oring
+
+# clean up
+rm -rf testdir outdir ring oring

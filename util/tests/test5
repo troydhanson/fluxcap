@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# create a tiny ring 
+# so we block in write
+shr-tool -c -s 1k ring
+
+# make test directories
+mkdir -p testdir
+
+# put content into testdir
+tar xf testdir.tar -C testdir
+
+# dump directory contents to ring
+echo "filling ring"
+../fwalk -d testdir -r ring # ok
+../fwalk -d testdir -r ring # ok
+../fwalk -d testdir -r ring # ok
+
+# we know from manual testing that
+# the next write would block for 
+# space availability in the ring
+echo "final write, should block"
+../fwalk -d testdir -r ring  &
+PID1=$!
+START_TIME=`date +%s`
+sleep 1
+
+# confirm that it is blocked. this
+# does not actually send a signal
+kill -0 $PID1
+if [ $? -eq 0 ]
+then 
+  echo "ok, blocked in ring write"
+else 
+  echo "failed to block in write!"
+  exit -1
+fi
+
+# schedule failsafe unmaskable signal
+echo "scheduling sigkill in 10s"
+(sleep 10; kill -9 $PID1) &
+
+# send more benign signal
+# to wake fwalk if it lets
+# in signals in shr-write
+# in bw_wait_ul -> select
+echo "sending sigterm in 1s"
+sleep 1
+kill -TERM $PID1
+
+# one or the other signal should 
+# make fwalk exit so wait for it
+wait $PID1
+echo "writer terminated (status $?)"
+END_TIME=`date +%s`
+let ELAPSED=$END_TIME-$START_TIME
+if [ $ELAPSED -gt 5 ]
+then
+  echo "terminated by failsafe signal,"
+  echo "this means standard signal was"
+  echo "insufficient to unblock writer"
+else
+  echo "good, standard signal suffices"
+fi
+
+# clean up
+rm -rf testdir ring

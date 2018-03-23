@@ -1,3 +1,5 @@
 ffcp
+fwalk
+fpcap-push
 fprune
 *.db

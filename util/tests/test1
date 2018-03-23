@@ -1,0 +1,9 @@
+#!/bin/bash
+
+mkdir -p testdir
+tar xf testdir.tar -C testdir
+shr-tool -c -s 1m ring
+
+../fwalk -d testdir -r ring
+shr-tool -r ring
+rm -rf testdir ring

@@ -1,0 +1,6 @@
+listing output directory
+outdir
+outdir/hello.gz
+listing output ring
+outdir/hello.gz
+hello, world!

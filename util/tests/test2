@@ -1,0 +1,46 @@
+#!/bin/bash
+# this test requires sudo to mount a ramdisk
+
+# create a ring
+shr-tool -c -s 1m ring
+
+# mount a ramdisk (need a real filesystem for fprune)
+mkdir -p ramdisk
+sudo ../ramdisk -c -s 1m ramdisk
+
+# we will make a directory to test pruning of empties
+mkdir ramdisk/empty
+
+# put content into ramdisk
+tar xf testdir.tar -C ramdisk
+dd if=/dev/zero of=ramdisk/0.dat bs=100k count=1
+dd if=/dev/zero of=ramdisk/1.dat bs=100k count=1
+
+echo pre-prune
+
+# dump directory contents to ring
+../fwalk -d ramdisk -r ring
+shr-tool -r ring
+
+# confirm empty directory is there
+find ramdisk -name empty
+
+# prune ramdisk to 10% of 1m (100k)
+../fprune -d ramdisk -p 10 -r ring -N 10 -u -W -P &
+PID1=$!
+sleep 5
+kill $PID1
+wait $PID1
+
+echo post-prune
+
+# dump directory contents to ring
+../fwalk -d ramdisk -r ring
+shr-tool -r ring
+
+# confirm empty directory is gone 
+find ramdisk -name empty
+
+# clean up
+sudo ../ramdisk -u ramdisk
+rm -rf ramdisk ring

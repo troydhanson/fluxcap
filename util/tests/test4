@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# create a ring
+shr-tool -c -s 1m ring oring
+
+# make test directories
+mkdir -p testdir outdir
+
+# put content into testdir
+echo "hello, world!" > testdir/hello
+
+# dump directory contents to ring
+../fwalk -d testdir -r ring
+
+# copy from ring files to outdir/basename.gz
+../ffcp -i ring -o oring -t 'outdir/$0' -z &
+PID1=$!
+sleep 5
+kill $PID1
+wait $PID1
+
+echo "listing output directory"
+find outdir
+
+echo "listing output ring"
+shr-tool -r oring
+
+# testing gunzip compatibility
+gunzip -c outdir/hello.gz
+
+# clean up
+rm -rf testdir outdir ring oring

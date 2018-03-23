@@ -41,14 +41,20 @@
 char read_buffer[BATCH_BYTES];
 struct iovec read_iov[BATCH_FRAMES];
 
+char tmp[PATH_MAX];
+char dir[PATH_MAX];
+char rpath1[PATH_MAX];
+char rpath2[PATH_MAX];
+char opath[PATH_MAX];
+
 struct {
   char *prog;
   int verbose;
-  int dry_run;
   int gzip;
   int mkpath;
   int epoll_fd;     /* epoll descriptor */
   int signal_fd;    /* to receive signals */
+  int fatal_signal_fd;/* fewer signals monitored in blocking i/o */
   int ring_fd;      /* ring readability fd */
   char *input_ring; /* ring file name */
   char *output_ring;/* ring file name */
@@ -61,16 +67,22 @@ struct {
   pcre *re;         /* compiled regex */
   int last_qlen;    /* last queue length from shr buffer */
   /* these are all work spaces for dealing with paths */
-  char tmp[PATH_MAX];
-  char dir[PATH_MAX];
-  char rpath1[PATH_MAX];
-  char rpath2[PATH_MAX];
-  char opath[PATH_MAX];
+  char *tmp;
+  char *dir;
+  char *rpath1;
+  char *rpath2;
+  char *opath;
 } cfg = {
+  .tmp = tmp,
+  .dir = dir,
+  .rpath1 = rpath1,
+  .rpath2 = rpath2,
+  .opath = opath,
   .buf = read_buffer,
   .iov = read_iov,
   .epoll_fd = -1,
   .signal_fd = -1,
+  .fatal_signal_fd = -1,
   .ring_fd = -1,
   .regex = "([^/]+)$", /* default: match any path, capture basename */
   .template = "$1",       /* default: output filename is input basename */
@@ -82,28 +94,35 @@ int sigs[] = {SIGHUP,SIGTERM,SIGINT,SIGQUIT,SIGALRM};
 void usage() {
   fprintf(stderr,"fluxcap file copy utility\n\n");
   fprintf(stderr,"This tool continuously copies files using a naming template.\n"
-                 "The original filenames arrive in the input ring. They are\n"
+                 "The original filenames must arrive in the input ring, from a\n"
+                 "compatible application (e.g. fwalk). The input filenames are\n"
                  "matched against the given regular expression. Matches are\n"
-                 "made into a new filename according to the given template.\n"
+                 "made into a new filename according to the output template.\n"
                  "The template uses captures from the regular expression by\n"
                  "referring to $0 (whole matching expression), $1 (first\n"
                  "capture), etc. After $9 the captures are $A through $Z.\n\n");
-  fprintf(stderr,"usage: %s <options>\n\n", cfg.prog);
+  fprintf(stderr,"usage: %s -i <ring> -t <template> [options]\n\n", cfg.prog);
   fprintf(stderr,"options:\n"
-                 "   -i <input-ring>    [required; input filenames in ring]\n"
-                 "   -r <regex>         [default: wildcard, capture basename]\n"
-                 "   -t <template>      [default: basename of original]\n"
-                 "   -o <output-ring>   [log output filenames to ring]\n"
-                 "   -m                 [create directories in output path]\n"
+                 "   -i <input-ring>    [input ring containing filenames]\n"
+                 "   -r <regex>         [match pattern; default match any]\n"
+                 "   -t <template>      [output name template e.g. 'out/$0']\n"
+                 "   -o <output-ring>   [output ring; receives filenames]\n"
+                 "   -m                 [auto create directories in template]\n"
                  "   -z                 [gzip the output file, appends .gz]\n"
-                 "   -d                 [dry-run; show names, no copying]\n"
+                 "   -v                 [verbose; use -vv to see captures]\n"
                  "   -h                 [this help]\n"
-                 "   -v                 [verbose; repeatable]\n"
                  "\n"
                  "In -z (gzip) mode, compression is toggled off temporarily\n"
                  "whenever the compression backlog exceeds 10 files.\n"
-                 "\n"
                  "\n");
+  fprintf(stderr,"examples:\n\n");
+  fprintf(stderr,"copy files to an output directory, keeping basenames:\n"
+                " %s -i ring -t 'outdir/$0'\n\n", cfg.prog);
+  fprintf(stderr,"copy files like 20180101/ABC/m to out/20180101/ABC.m:\n"
+                " %s -i ring -m -r '(\\d{8})/(\\w{3})/(.*)$' -t 'out/$1/$2.$3'",
+                 cfg.prog);
+  fprintf(stderr,"\n");
+  fprintf(stderr,"\n");
   exit(-1);
 }
 
@@ -141,17 +160,20 @@ int periodic_work(void) {
 }
 
 int handle_signal(void) {
-  int rc=-1;
   struct signalfd_siginfo info;
+  int rc=-1, sc;
+  ssize_t nr;
   
-  if (read(cfg.signal_fd, &info, sizeof(info)) != sizeof(info)) {
+  nr = read(cfg.signal_fd, &info, sizeof(info));
+  if (nr != sizeof(info)) {
     fprintf(stderr,"failed to read signal fd buffer\n");
     goto done;
   }
 
   switch(info.ssi_signo) {
     case SIGALRM: 
-      if (periodic_work() < 0) goto done;
+      sc = periodic_work();
+      if (sc < 0) goto done;
       alarm(1); 
       break;
     default: 
@@ -175,11 +197,6 @@ int zip_copy(char *file, char *dest) {
   char *src=NULL,*dst=NULL;
   struct stat s;
   size_t zmax, len;
-
-  if (cfg.dry_run) {
-    rc = 0;
-    goto done;
-  }
 
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
@@ -276,11 +293,6 @@ int map_copy(char *file, char *dest) {
   struct stat s;
   char *src=NULL,*dst=NULL;
   int fd=-1,dd=-1,rc=-1;
-
-  if (cfg.dry_run) {
-    rc = 0;
-    goto done;
-  }
 
   /* source file */
   if ( (fd = open(file, O_RDONLY)) == -1) {
@@ -400,7 +412,7 @@ int pat2path(char *file, int *ovec, int pe) {
 
   p = cfg.template;
   o = cfg.opath;
-  olen = sizeof(cfg.opath);
+  olen = PATH_MAX;
 
   while (*p != '\0') {
     if (*p == '$') {    /* translate next template character */
@@ -440,7 +452,7 @@ int pat2path(char *file, int *ovec, int pe) {
   if (same_file(cfg.opath, file)) goto done;
   rc = 0;
 
-  if (cfg.dry_run || cfg.verbose) {
+  if (cfg.verbose) {
     fprintf(stderr, "%s -> %s\n", file, cfg.opath);
   }
 
@@ -455,18 +467,13 @@ int mkpath(char *path) {
   char *b, *e;
   size_t l;
 
-  if (cfg.dry_run) {
-    rc = 0;
-    goto done;
-  }
-
   b = path;
   e = path;
   while (1) {
     while ((*e != '/') && (*e != '\0')) e++;
     if (*e == '\0') break;
     l = e-b+1;
-    if (l+1 > sizeof(cfg.dir)) goto done;
+    if (l+1 > PATH_MAX) goto done;
     memcpy(cfg.dir, b, l);
     cfg.dir[l] = '\0';
     ec = stat(cfg.dir, &s);
@@ -491,7 +498,7 @@ int process(char *file, size_t len) {
   int ovec[OVECSZ], rc = -1, pe, l, i, ec;
 
   /* make a nul terminated string */
-  if (len+1 > sizeof(cfg.tmp)) goto done;
+  if (len+1 > PATH_MAX) goto done;
   memcpy(cfg.tmp, file, len);
   cfg.tmp[len] = '\0';
 
@@ -521,7 +528,7 @@ int process(char *file, size_t len) {
   if (cfg.gzip && (cfg.last_qlen < GZIP_TOGGLE_THRESH)) {
     /* add the .gz extension */
     l = strlen(cfg.opath);
-    if (l+1+3 > sizeof(cfg.opath)) goto done;
+    if (l+1+3 > PATH_MAX) goto done;
     memcpy(cfg.opath+l, ".gz", 4);
     ec = zip_copy(cfg.tmp, cfg.opath);
     if (ec < 0) goto done;
@@ -593,16 +600,14 @@ int parse_regex(void) {
 }
 
 int main(int argc, char *argv[]) {
-  int opt, rc=-1, n, ec;
+  int opt, rc=-1, n, ec, sc;
   struct epoll_event ev;
   cfg.prog = argv[0];
-  char unit, *c, buf[100];
 
   while ( (opt = getopt(argc,argv,"vmdht:r:i:o:z")) > 0) {
     switch(opt) {
       case 'v': cfg.verbose++; break;
       case 'h': default: usage(); break;
-      case 'd': cfg.dry_run=1; break;
       case 'm': cfg.mkpath=1; break;
       case 'z': cfg.gzip=1; break;
       case 'r': cfg.regex = strdup(optarg); break;
@@ -645,14 +650,35 @@ int main(int argc, char *argv[]) {
   cfg.ring_fd = shr_get_selectable_fd(cfg.ring);
   if (cfg.ring_fd < 0) goto done;
 
+  /* fewer signals we'll allow to interrupt a blocking shr_write */
+  sigset_t sf;
+  sigemptyset(&sf);
+  sigaddset(&sf, SIGTERM);
+  sigaddset(&sf, SIGINT);
+
+  /* create more selective signalfd for monitoring inside shr_write */
+  cfg.fatal_signal_fd = signalfd(-1, &sf, 0);
+  if (cfg.fatal_signal_fd == -1) {
+    fprintf(stderr,"signalfd: %s\n", strerror(errno));
+    goto done;
+  }
+
   if (cfg.output_ring) {
     cfg.oring = shr_open(cfg.output_ring, SHR_WRONLY);
     if (cfg.oring == NULL) goto done;
+
+		/* make shr write blocking monitor signalfd */
+		sc = shr_ctl(cfg.oring, SHR_POLLFD, cfg.fatal_signal_fd);
+		if (sc < 0) {
+			fprintf(stderr,"shr_ctl: error\n");
+			goto done;
+		}
   }
 
   /* add descriptors of interest to epoll */
   if (add_epoll(EPOLLIN, cfg.signal_fd)) goto done;
   if (add_epoll(EPOLLIN, cfg.ring_fd)) goto done;
+
 
   alarm(1);
 
@@ -672,9 +698,13 @@ int main(int argc, char *argv[]) {
   rc = 0;
  
  done:
+  /* don't free(cfg.regex),     may be initialized data */
+  /* don't free(cfg.template),  may be initialized data */
+  if (cfg.re) pcre_free(cfg.re);
   if (cfg.ring) shr_close(cfg.ring);
   if (cfg.oring) shr_close(cfg.oring);
   if (cfg.signal_fd != -1) close(cfg.signal_fd);
+  if (cfg.fatal_signal_fd != -1) close(cfg.fatal_signal_fd);
   if (cfg.epoll_fd != -1) close(cfg.epoll_fd);
   if (cfg.input_ring) free(cfg.input_ring);
   if (cfg.output_ring) free(cfg.output_ring);

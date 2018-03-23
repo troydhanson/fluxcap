@@ -1,0 +1,13 @@
+listing output directory
+outdir
+outdir/20180101
+outdir/20180101/ABC.m.gz
+outdir/20180101/DEF.m.gz
+outdir/20180102
+outdir/20180102/ABC.m.gz
+outdir/20180102/DEF.m.gz
+listing output ring
+outdir/20180101/ABC.m.gz
+outdir/20180101/DEF.m.gz
+outdir/20180102/ABC.m.gz
+outdir/20180102/DEF.m.gz

@@ -1,0 +1,7 @@
+filling ring
+final write, should block
+ok, blocked in ring write
+scheduling sigkill in 10s
+sending sigterm in 1s
+writer terminated (status 0)
+good, standard signal suffices

@@ -1,0 +1,15 @@
+pre-prune
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/0.dat
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/1.dat
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180101/ABC/m
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180101/DEF/m
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180102/ABC/m
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180102/DEF/m
+ramdisk/empty
+files.map: 10 slots (0 GB)
+post-prune
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/1.dat
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180101/ABC/m
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180101/DEF/m
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180102/ABC/m
+/home/thanson/checkouts/public/fluxcap/util/tests/ramdisk/20180102/DEF/m

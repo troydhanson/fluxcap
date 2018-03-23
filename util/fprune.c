@@ -63,6 +63,9 @@ struct fs_ent {
 char read_buffer[BATCH_BYTES];
 struct iovec read_iov[BATCH_FRAMES];
 
+char dir[PATH_MAX];
+char tmp[PATH_MAX];
+
 struct {
   char *prog;
   int verbose;
@@ -81,8 +84,8 @@ struct {
   struct iovec *iov;/* iov for shr_readv */
   size_t niov;      /* number iov ready */
   struct statvfs vfs;
-  char dir[PATH_MAX]; /* tree to prune (realpath) */
-  char tmp[PATH_MAX]; /* temp in add and unlink_path */
+  char *dir;        /* tree to prune (realpath) */
+  char *tmp;        /* temp in add and unlink_path */
   char *table_file;
   int table_fd;
   size_t tb;
@@ -93,6 +96,8 @@ struct {
   struct fs_ent *fe_tree; /* hash table in-use fs_ent */
   struct fs_ent *fe_free; /* DL of free fs_ent */
 } cfg = {
+  .dir = dir,
+  .tmp = tmp,
   .buf = read_buffer,
   .iov = read_iov,
   .epoll_fd = -1,
@@ -138,7 +143,7 @@ void usage() {
                  "   -u                 [skip stat/sort; use ring order]\n"
                  "   -w                 [walk mode; walk tree rooted at dir]\n"
                  "   -W                 [fork subprocess in walk mode]\n"
-                 "   -P                 [walk mode; prune empty directories]\n"
+                 "   -P                 [in walk mode, prune empty dirs]\n"
                  "   -h                 [this help]\n"
                  "\n"
                  "\n"
