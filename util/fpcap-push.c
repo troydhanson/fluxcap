@@ -259,7 +259,7 @@ int push_file(char *file, size_t len) {
 
   /* TODO observe gz or xz suffix */
   /* map, parse, inject packets */
-  fprintf("UNIMPLEMENTED\n");
+  fprintf(stderr, "UNIMPLEMENTED\n"); /* FIXME FINISH */
   assert(0);
 
 

@@ -5,6 +5,11 @@ ramdisk_SOURCES = ramdisk.c
 ramdisk_CPPFLAGS = -I$(srcdir)/../lib/libut/include 
 watch_copy_SOURCES = watch_copy.c
 
+bin_PROGRAMS += fprune
+fprune_SOURCES = fprune.c
+fprune_CPPFLAGS = -I$(srcdir)/../lib/libut/include
+fprune_LDADD = -L../lib -lut -lshr
+
 if HAVE_PCRE
 if HAVE_ZLIB
 bin_PROGRAMS += ffcp
@@ -27,15 +32,3 @@ fpcap_push_SOURCES = fpcap-push.c
 fpcap_push_CPPFLAGS = -I$(srcdir)/../lib/libut/include
 fpcap_push_LDADD = -L../lib -lut -lshr -lz
 endif
-
-bin_PROGRAMS += fprune
-fprune_SOURCES = fprune.c
-fprune_CPPFLAGS = -I$(srcdir)/../lib/libut/include
-fprune_LDADD = -L../lib -lut -lshr
-
-if HAVE_NCURSES
-endif
-
-if HAVE_SQLITE3
-endif
-
