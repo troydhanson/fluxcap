@@ -15,6 +15,7 @@
 #include <limits.h>
 
 #define TMPFS_MAGIC           0x01021994
+#define RAMFS_MAGIC           0x858458F6
  
 /******************************************************************************
  * ramdisk
@@ -33,6 +34,7 @@
 
 /* command line configuration parameters */
 int verbose;
+int ramfs;
 enum {MODE_NONE,MODE_QUERY,MODE_CREATE,MODE_UNMOUNT} mode = MODE_NONE;
 char *sz="50%";
 char *ramdisk;
@@ -44,9 +46,10 @@ void usage(char *prog) {
   fprintf(stderr, "\n");
   fprintf(stderr,"usage:\n\n");
   fprintf(stderr, "-c (create mode):\n");
-  fprintf(stderr, "   %s -c [-s <size>] [-d <dir>] <ramdisk-mount-point>\n", prog);
+  fprintf(stderr, "   %s -c [-s <size>] [-d <dir>] [-r] <mount-point>\n", prog);
   fprintf(stderr, "   -s <size> suffixed with k|m|g|%% [default: 50%%]\n");
   fprintf(stderr, "   -d <dir> directory to post-create inside ramdisk (repeatable)\n");
+  fprintf(stderr, "   -r use ramfs instead of tmpfs (grows unbounded, no swap)\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "-q (query mode):\n");
   fprintf(stderr, "   %s -q <ramdisk-mount-point>\n", prog);
@@ -96,7 +99,8 @@ int suitable_mountpoint(char *dir, struct stat *sb, struct statfs *sf) {
   }
   int is_mountpoint = (psb.st_dev == sb->st_dev) ? 0 : 1;
   int is_tmpfs = (sf->f_type == TMPFS_MAGIC);
-  if (is_mountpoint && is_tmpfs) {
+  int is_ramfs = (sf->f_type == RAMFS_MAGIC);
+  if (is_mountpoint && (is_tmpfs || is_ramfs)) {
     //syslog(LOG_INFO, "already a tmpfs mountpoint: %s\n", dir, strerror(errno));
     return -2;
   }
@@ -113,6 +117,10 @@ int query_ramdisk(void) {
     printf("%s: not a ramdisk\n", ramdisk);
     return -1;
   }
+  if (sf.f_type == RAMFS_MAGIC) {
+    printf("%s: ramfs ramdisk (unbounded size)\n", ramdisk);
+    return 0;
+  }
   char szb[100];
   long bytes = sf.f_bsize*sf.f_blocks;
   if (bytes < KB) snprintf(szb, sizeof(szb), "%ld bytes", bytes);
@@ -121,6 +129,7 @@ int query_ramdisk(void) {
   else                 snprintf(szb, sizeof(szb), "%ld gb", bytes/GB);
   int used_pct = 100 - (sf.f_bfree * 100.0 / sf.f_blocks);
   printf("%s: ramdisk of size %s (%d%% used)\n", ramdisk, szb, used_pct);
+  return 0;
 }
 
 int unmount_ramdisk(void) {
@@ -138,15 +147,18 @@ int unmount_ramdisk(void) {
 
 int create_ramdisk(void) {
   int rc;
-  char opts[100];
+  char opts[100], *kind;
 
   struct stat sb; struct statfs sf;
   rc = suitable_mountpoint(ramdisk, &sb, &sf);
   if (rc) return rc;
 
+  kind = "tmpfs";
+  if (ramfs) kind = "ramfs";
+
   /* ok, mount a ramdisk on this point */
   snprintf(opts,sizeof(opts),"size=%s",sz);
-  rc=mount("none", ramdisk, "tmpfs", MS_NOATIME|MS_NODEV, opts);
+  rc=mount("none", ramdisk, kind, MS_NOATIME|MS_NODEV, opts);
   if (rc) syslog(LOG_ERR, "can't make ramdisk %s: %s\n", ramdisk, strerror(errno));
   return rc;
 }
@@ -167,9 +179,10 @@ int main(int argc, char * argv[]) {
   int opt, rc;
   utarray_new(dirs,&ut_str_icd);
  
-  while ( (opt = getopt(argc, argv, "v+cqus:hd:")) != -1) {
+  while ( (opt = getopt(argc, argv, "v+cqus:hd:r")) != -1) {
     switch (opt) {
       case 'v': verbose++; break;
+      case 'r': ramfs=1; break;
       case 'q': if (mode) usage(argv[0]); mode=MODE_QUERY; break;
       case 'c': if (mode) usage(argv[0]); mode=MODE_CREATE; break;
       case 'u': if (mode) usage(argv[0]); mode=MODE_UNMOUNT; break;

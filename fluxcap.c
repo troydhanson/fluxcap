@@ -3,6 +3,7 @@
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -16,6 +17,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
+#include <netdb.h>
+#include <fcntl.h>
 #include <poll.h>
 #include "shr.h"
 #include "libut.h"
@@ -45,6 +48,8 @@ struct {
   size_t size; /* ring create size (-cr), or snaplen (-rx/-tx) */
   struct encap encap;
   struct itimerspec timer;
+  uint16_t ip_id; /* for implementing IP fragmentation when */
+  int mtu;        /* using gre encapsulation */
   /* auxilliary rings; for tee or funnel modes */
   UT_vector /* of ptr */ *aux_rings;
   UT_vector /* of int */ *aux_fd;
@@ -157,12 +162,9 @@ void usage() {
        "\n"
        "GRE encapsulation modes (tx-only):\n"
        "\n"
-       "    -tx -E gretap:<ip> <ring>    (GRETAP encapsulation; preferred)\n"
-       "    -tx -E gre:<ip>    <ring>    (GRE encapsulation)\n"
-       "    -tx -E erspan:<ip> <ring>    (ERSPAN encapsulation; untested!)\n"
-       "\n"
-       "  Use snaplen with a GRE tunnel, e.g., '-s 1476' to avoid tx errors,\n"
-       "  as GRE tunnel MTU is 24 bytes less than physical interface IP MTU.\n"
+       "    -tx -E gretap:<host> <ring>    (GRETAP encapsulation; preferred)\n"
+       "    -tx -E gre:<host>    <ring>    (GRE encapsulation)\n"
+       "    -tx -E erspan:<host> <ring>    (ERSPAN encapsulation; untested!)\n"
        "\n"
        "other options:\n"
        "\n"
@@ -230,6 +232,220 @@ int new_epoll(int events, int fd) {
   if (rc == -1) {
     fprintf(stderr,"epoll_ctl: %s\n", strerror(errno));
   }
+  return rc;
+}
+
+/*
+ * read_proc
+ *
+ * read a complete file from the /proc filesystem
+ * this is special because its size is not known a priori
+ * so a read/realloc loop is needed
+ *
+ * size into len, returning buffer or NULL on error.
+ * caller should free the buffer eventually.
+ */
+char *read_proc(char *file, size_t *len) {
+  char *buf=NULL, *b, *tmp;
+  int fd = -1, rc = -1, eof=0;
+  size_t sz, br=0, l;
+  ssize_t nr;
+
+  /* initial guess at a sufficient buffer size */
+  sz = 1000;
+
+  fd = open(file, O_RDONLY);
+  if (fd < 0) {
+    fprintf(stderr,"open: %s\n", strerror(errno));
+    goto done;
+  }
+
+  while(!eof) {
+
+    tmp = realloc(buf, sz);
+    if (tmp == NULL) {
+      fprintf(stderr, "out of memory\n");
+      goto done;
+    }
+
+    buf = tmp;
+    b = buf + br;
+    l = sz - br;
+
+    do {
+      nr = read(fd, b, l);
+      if (nr < 0) {
+        fprintf(stderr,"read: %s\n", strerror(errno));
+        goto done;
+      }
+
+      b += nr;
+      l -= nr;
+      br += nr;
+
+      /* out of space? double buffer size */
+      if (l == 0) { 
+        sz *= 2;
+        break;
+      }
+
+      if (nr == 0) eof = 1;
+
+    } while (nr > 0);
+  }
+
+  *len = br;
+  rc = 0;
+
+ done:
+  if (fd != -1) close(fd);
+  if (rc && buf) { free(buf); buf = NULL; }
+  return buf;
+}
+
+/*
+ * find start and length of column N (one-based)
+ * in input buffer buf of length buflen
+ *
+ * columns must be space-or-tab delimited
+ * returns NULL if column not found
+ *
+ * the final column may end in newline or eob  
+ *
+ * col: column index (1-based)
+ * len: OUTPUT parameter (column length)
+ * buf: buffer to find columns in
+ * buflen: length of buf
+ *
+ * returns:
+ *   pointer to column N, or NULL
+ */
+#define ws(x) (((x) == ' ') || ((x) == '\t'))
+char *get_col(int col, size_t *len, char *buf, size_t buflen) {
+  char *b, *start=NULL, *eob;
+  int num;
+
+  eob = buf + buflen;
+
+  b = buf;
+  num = 0;  /* column number */
+  *len = 0; /* column length */
+
+  while (b < eob) {
+
+    if (ws(*b) && (num == col)) break; /* end of sought column */
+    if (*b == '\n') break;             /* end of line */
+
+    if (ws(*b)) *len = 0;              /* skip over whitespace */
+    if ((!ws(*b)) && (*len == 0)) {    /* record start of column */
+      num++;
+      start = b;
+    }
+    if (!ws(*b)) (*len)++;             /* increment column length */
+    b++;
+  }
+
+  if ((*len) && (num == col)) return start;
+  return NULL;
+}
+
+/*
+ * find route for a given destination IP address
+ *
+ * parameters:
+ *  dest_ip:   the destination IP address in network order
+ *  interface: char[] to receive the output NIC interface name
+ *             must be at least IF_NAMESIZE bytes long;
+ *             see IF_NAMESIZE in /usr/include/net/if.h
+ * returns:
+ *   0 success
+ *  -1 error parsing routing table
+ *  -2 no route found
+ *
+ */
+int find_route(uint32_t dest_ip, 
+               char *interface) {
+
+  int rc = -1, sc;
+  char *buf=NULL, *line, *b, *iface, *s_dest, *s_gw, *s_mask;
+  unsigned mask, dest, gw, best_mask=0, nroutes=0;
+  size_t len, sz=0, to_eob, iface_len;
+
+  buf = read_proc("/proc/net/route", &sz);
+  if (buf == NULL) goto done;
+
+  /* find initial newline; discard header row */
+  b = buf;
+  while ((b < buf+sz) && (*b != '\n')) b++;
+  line = b+1;
+
+  while (line < buf+sz) {
+
+    to_eob = sz-(line-buf);
+
+    s_dest = get_col(2, &len, line, to_eob);
+    if (s_dest == NULL) goto done;
+    sc = sscanf(s_dest, "%x", &dest);
+    if (sc != 1) goto done;
+
+    s_mask = get_col(8, &len, line, to_eob);
+    if (s_mask == NULL) goto done;
+    sc = sscanf(s_mask, "%x", &mask);
+    if (sc != 1) goto done;
+
+    iface = get_col(1, &iface_len, line, to_eob);
+    if (iface == NULL) goto done;
+
+    /* advance to next line */
+    b = line;
+    while ((b < buf+sz) && (*b != '\n')) b++;
+    line = b+1;
+
+    /* does the route apply? */
+    if ((dest_ip & mask) != dest) continue;
+
+    /* know a more specific route? */
+    if (mask < best_mask) continue;
+
+    /* this is the best route so far */
+    best_mask = mask;
+
+    /* copy details of this route */
+    if (iface_len + 1 > IF_NAMESIZE) goto done;
+    memcpy(interface, iface, iface_len);
+    interface[iface_len] = '\0';
+    nroutes++;
+  }
+
+  rc = nroutes ? 0 : -2;
+
+ done:
+  if (buf) free(buf);
+  return rc;
+}
+
+/* get the MTU for the interface, or -1 on error */
+int get_if_mtu(char *eth) {
+  int fd = -1, sc, rc = -1;
+  struct ifreq ifr;
+
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd == -1) {
+    fprintf(stderr, "socket: %s\n", strerror(errno));
+    goto done;
+  }
+
+  strncpy(ifr.ifr_name, eth, sizeof(ifr.ifr_name));
+  sc = ioctl(fd, SIOCGIFMTU, &ifr);
+  if (sc < 0) {
+    fprintf(stderr, "ioctl: %s\n", strerror(errno));
+    goto done;
+  }
+
+  rc = ifr.ifr_mtu;
+
+ done:
+  if (fd != -1) close(fd);
   return rc;
 }
 
@@ -431,16 +647,13 @@ int setup_rx(void) {
  *
  */
 int setup_tx(void) {
+  char interface[IF_NAMESIZE], *ip;
   int rc=-1, ec, one = 1;
 
   if (cfg.encap.enable) {
 
-    if (cfg.size == 0) {
-      fprintf(stderr, "warning: -s <snaplen> advised with GRE encapsulation\n");
-    }
-
-    /* in encapsulation mode, use raw IP socket. IPPROTO GRE == 47 */
-    cfg.tx_fd = socket(AF_INET, SOCK_RAW, 47);
+    /* in encapsulation mode, use raw IP socket. */
+    cfg.tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_GRE);
     if (cfg.tx_fd == -1) {
       fprintf(stderr,"socket: %s\n", strerror(errno));
       goto done;
@@ -451,6 +664,28 @@ int setup_tx(void) {
     if (ec < 0) {
       fprintf(stderr,"setsockopt IP_HDRINCL: %s\n", strerror(errno));
       goto done;
+    }
+
+    /* we need the mtu of the egress NIC to implement IP fragmentation,
+     * if needed, since raw sockets do not do that for us. to get the 
+     * interface mtu, we need the egress interface, based on routing */
+    ec = find_route( cfg.encap.dst.s_addr, interface);
+    if (ec < 0) {
+      ip = inet_ntoa(cfg.encap.dst);
+      fprintf(stderr, "can't determine route to %s\n", ip);
+      goto done;
+    }
+
+    cfg.mtu = get_if_mtu(interface);
+    if (cfg.mtu < 0) {
+      fprintf(stderr, "mtu lookup failed: %s\n", interface);
+      goto done;
+    }
+
+    if (cfg.verbose) {
+      ip = inet_ntoa(cfg.encap.dst);
+      fprintf(stderr, "encapsulating to %s on interface %s mtu %d\n",
+        ip, interface, cfg.mtu);
     }
 
     rc = 0;
@@ -681,7 +916,7 @@ int update_rd_drops(void) {
     goto done;
   }
 
-  st.rd_drops += shr_fan_stat(cfg.ring, 1);
+  st.rd_drops += shr_farm_stat(cfg.ring, 1);
 
   sc = shr_appdata(cfg.ring, NULL, stp, &st_sz); /* "set" */
   if (sc < 0) {
@@ -974,7 +1209,6 @@ int handle_signal(void) {
   return rc;
 }
 
-
 /*
  * handle_timer
  *
@@ -1004,14 +1238,37 @@ int handle_timer(void) {
   return rc;
 }
 
+/*
+ * encapsulate_tx
+ *
+ * using a raw IP socket, transmit GRE-encapsulated packets.
+ * if necessary, perform IP fragmentation ourselves, as this
+ * is not done by the OS when using raw sockets.
+ */
 char gbuf[MAX_PKT];
-char *encapsulate(char *tx, ssize_t *nx) {
-  char *g = gbuf, *ethertype;
-  if (*nx < 14) return NULL;
-  uint32_t ip_src = 0;
-  uint32_t ip_dst = cfg.encap.dst.s_addr;
-  uint32_t seqno;
-  uint16_t encap_ethertype;
+int encapsulate_tx(char *tx, ssize_t nx) {
+  uint16_t encap_ethertype, more_fragments=1, fo=0, fn=0;
+  uint32_t ip_src, ip_dst, seqno, off;
+  struct sockaddr_in sin;
+  struct sockaddr *dst;
+  char *g, *ethertype;
+  ssize_t nr, fl;
+  socklen_t sz;
+
+  assert(nx >= 14);
+
+  ip_src = 0;
+  ip_dst = cfg.encap.dst.s_addr;
+
+  sin.sin_family = AF_INET;
+  sin.sin_port = 0;
+  sin.sin_addr = cfg.encap.dst;
+  dst = (struct sockaddr*)&sin;
+  sz = sizeof(sin);
+
+  cfg.ip_id++;
+  g = gbuf;
+  off = 0;
 
   /* construct 20-byte IP header. 
    * NOTE: some zeroed header fields are filled out for us, when we send this
@@ -1022,12 +1279,12 @@ char *encapsulate(char *tx, ssize_t *nx) {
   g[1] = 0;       /* DSCP / ECN */
   g[2] = 0;       /* total length (upper byte) (see NOTE) */
   g[3] = 0;       /* total length (lower byte) (see NOTE) */
-  g[4] = 0;       /* datagam id (upper byte); for frag reassembly (see NOTE) */
-  g[5] = 0;       /* datagam id (lower byte); for frag reassembly (see NOTE) */
-  g[6] = 0;       /* flags and upper bits of frag offset */
+  g[4] = (cfg.ip_id & 0xff00) >> 8; /* id (upper byte); for frag reassembly */
+  g[5] = (cfg.ip_id & 0x00ff);      /* id (lower byte); for frag reassembly */
+  g[6] = 0;       /* 0 DF MF flags and upper bits of frag offset */
   g[7] = 0;       /* lower bits of frag offset */
   g[8] = 255;     /* TTL */
-  g[9] = 47;      /* IP protocol GRE */
+  g[9] = IPPROTO_GRE; /* IP protocol GRE == 47 */
   g[10] = 0;      /* IP checksum (high byte) (see NOTE) */
   g[11] = 0;      /* IP checksum (low byte) (see NOTE) */
   memcpy(&g[12], &ip_src, sizeof(ip_src)); /* IP source (see NOTE) */
@@ -1044,11 +1301,11 @@ char *encapsulate(char *tx, ssize_t *nx) {
       ethertype = &tx[12]; /* copy ethertype from packet into GRE header */
       memcpy(g, ethertype, sizeof(uint16_t));
       g += 2;
-      *nx -= 14; tx += 14; // elide original MACs and ethertype!
-      assert(*nx <= sizeof(gbuf)-(g-gbuf)); /* TODO skip not assert */
-      memcpy(g, tx, *nx);
-      g += *nx;
-      *nx = g-gbuf;
+      nx -= 14; tx += 14; // elide original MACs and ethertype!
+      assert(nx <= sizeof(gbuf)-(g-gbuf));
+      memcpy(g, tx, nx);
+      g += nx;
+      nx = g-gbuf;
       break;
     case mode_gretap:
       memset(g, 0, 2);     /* zero first two bytes of GRE header */
@@ -1056,10 +1313,10 @@ char *encapsulate(char *tx, ssize_t *nx) {
       encap_ethertype = htons(0x6558); /* transparent ethernet bridging */
       memcpy(g, &encap_ethertype, sizeof(uint16_t));
       g += 2;
-      assert(*nx <= sizeof(gbuf)-(g-gbuf)); /* TODO skip not assert */
-      memcpy(g, tx, *nx);
-      g += *nx;
-      *nx = g-gbuf;
+      assert(nx <= sizeof(gbuf)-(g-gbuf));
+      memcpy(g, tx, nx);
+      g += nx;
+      nx = g-gbuf;
       break;
     case mode_erspan:
       g[0] = 1 << 4;  /* turn on GRE "S" bit to indicate sequence num option */
@@ -1086,17 +1343,54 @@ char *encapsulate(char *tx, ssize_t *nx) {
       g[7] = 0;        /* index LSB word; bits 7-0 of index */
       g += 8;
       /* packet */
-      assert(*nx <= sizeof(gbuf)-(g-gbuf)); /* TODO truncate not assert */
-      memcpy(g, tx, *nx);
-      g += *nx;
-      *nx = g-gbuf;
+      assert(nx <= sizeof(gbuf)-(g-gbuf));
+      memcpy(g, tx, nx);
+      g += nx;
+      nx = g-gbuf;
       break;
     default:
       assert(0);
       break;
   }
 
-  return gbuf;
+  /*
+   * send IP packet, performing fragmentation if greater than mtu
+   */
+  do {
+
+    more_fragments = (nx > cfg.mtu) ? 1 : 0;
+    assert((off & 0x7) == 0);
+    fo = off / 8;
+
+    gbuf[6]  = more_fragments ? (1 << 5) : 0; /* 0 DF [MF] flag */
+    gbuf[6] |= (fo & 0x1f00) >> 8; /* upper bits of frag offset */
+    gbuf[7] =  fo & 0x00ff;        /* lower bits of frag offset */
+
+    /* choose fragment length so it's below MTU and so the payload 
+     * length after 20 byte header is a multiple of 8 as required */
+    if (more_fragments)
+      fl = ((cfg.mtu - 20) & ~7U) + 20;
+    else
+      fl = nx;
+
+    nr = sendto(cfg.tx_fd, gbuf, fl, 0, dst, sz);
+    if (nr != fl) {
+      fprintf(stderr,"sendto: %s\n", (nr<0) ? 
+        strerror(errno) : "incomplete");
+      return -1;
+    }
+
+    /* keeping 20-byte IP header, slide next fragment payload */
+    if (more_fragments) {
+      assert(fl > 20);
+      memmove(&gbuf[20], &gbuf[fl], nx - fl);
+      off += (fl - 20);
+      nx  -= (fl - 20);
+    }
+
+  } while (more_fragments);
+
+  return 0;
 }
 
 /* inject four bytes to the ethernet frame with an 802.1q vlan tag.
@@ -1288,29 +1582,19 @@ int transmit_packets(void) {
 
     /* wrap encapsulation around it, if enabled */
     if (cfg.encap.enable) {
-      tx = encapsulate(tx,&nx);
-      if (tx == NULL) {
-        fprintf(stderr, "encapsulation failed\n");
-        goto done;
-      }
 
-      sin.sin_family = AF_INET;
-      sin.sin_port = 0;
-      sin.sin_addr = cfg.encap.dst;
-      dst = (struct sockaddr*)&sin;
-      sz = sizeof(sin);
-    }
+      if (encapsulate_tx(tx, nx)) goto done;
+      continue;
 
-    /* transmit the packet (standard tx mode) */
-    if (cfg.encap.enable || (cfg.use_tx_ring == 0)) {
+    } else if (cfg.use_tx_ring == 0) {
 
       nt = sendto(cfg.tx_fd, tx, nx, 0, dst, sz);
       if (nt != nx) {
-        fprintf(stderr,"sendto: %s\n", (nt<0) ? strerror(errno) : "incomplete");
+        fprintf(stderr,"sendto: %s\n", (nt<0) ? 
+          strerror(errno) : "incomplete");
         goto done;
       }
 
-      /* resume while loop with next packet */
       continue;
     }
 
@@ -1598,6 +1882,7 @@ size_t kmgt(char *optarg) {
 int parse_encap(char *opt) {
   int rc = -1;
   char *mode=opt,*dst=opt, *colon;
+  struct hostent *e;
 
   colon = strchr(mode,':');
   if (colon == NULL) {
@@ -1616,11 +1901,18 @@ int parse_encap(char *opt) {
 
   dst = colon+1;
 
-  if (inet_aton(dst, &cfg.encap.dst) == 0) {
-    fprintf(stderr,"invalid ip: %s\n", dst);
+  e = gethostbyname(dst);
+  if (e == NULL) {
+    fprintf(stderr, "gethostbyname: %s: %s\n", dst, hstrerror(h_errno));
     goto done;
   }
 
+  if (e->h_length != sizeof(cfg.encap.dst)) {
+    fprintf(stderr, "DNS result size mismatch\n");
+    goto done;
+  }
+
+  memcpy(&cfg.encap.dst.s_addr, e->h_addr, e->h_length);
   rc = 0;
 
  done:
@@ -1783,7 +2075,7 @@ int main(int argc, char *argv[]) {
       if (cfg.size == 0) usage();
       while (optind < argc) {
         file = argv[optind++];
-        init_mode = SHR_DROP|SHR_FAN|SHR_APPDATA;
+        init_mode = SHR_DROP|SHR_FARM|SHR_APPDATA;
         if (cfg.keep) init_mode |= SHR_KEEPEXIST;
         if (cfg.verbose) fprintf(stderr,"creating %s\n", file);
         sc = shr_init(file, cfg.size, init_mode, &cfg.stats, sizeof(cfg.stats));
@@ -1806,7 +2098,7 @@ int main(int argc, char *argv[]) {
       utstring_clear(cfg.tmp);
       utstring_printf(cfg.tmp, "/dev/shm/stat.%u", (int)getpid());
       file = utstring_body(cfg.tmp);
-      init_mode = SHR_DROP|SHR_FAN;
+      init_mode = SHR_DROP|SHR_FARM;
       cfg.size = utvector_len(cfg.watch_win) * 
                  (sizeof(size_t) + sizeof(struct ww));
       sc = shr_init(file, cfg.size, init_mode);
