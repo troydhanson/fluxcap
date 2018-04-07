@@ -259,6 +259,8 @@ int push_file(char *file, size_t len) {
 
   /* TODO observe gz or xz suffix */
   /* map, parse, inject packets */
+  fprintf("UNIMPLEMENTED\n");
+  assert(0);
 
 
   rc = 0;

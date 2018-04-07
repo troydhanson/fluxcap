@@ -1,27 +1,3 @@
-#include <linux/if_packet.h>
-#include <net/ethernet.h>
-#include <sys/signalfd.h>
-#include <sys/timerfd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <sys/epoll.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <arpa/inet.h>
-#include <sys/mman.h>
-#include <signal.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <net/if.h>
-#include <assert.h>
-#include <stdio.h>
-#include <errno.h>
-#include <netdb.h>
-#include <fcntl.h>
-#include <poll.h>
-#include "shr.h"
-#include "libut.h"
 #include "fluxcap.h"
 
 /* 

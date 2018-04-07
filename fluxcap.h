@@ -5,6 +5,7 @@
 #include <net/ethernet.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -19,11 +20,13 @@
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
+#include <netdb.h>
+#include <fcntl.h>
 #include <poll.h>
 #include "shr.h"
 #include "libut.h"
 
-#define FLUXCAP_VERSION "1.4"
+#define FLUXCAP_VERSION "2.0"
 #define MAX_PKT 100000         /* max length of packet */
 #define MAX_NIC 64             /* longest NIC name we accept */
 #define BATCH_SIZE (1024*1024) /* bytes buffered before shr_writev */
