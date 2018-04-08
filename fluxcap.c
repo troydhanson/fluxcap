@@ -124,7 +124,7 @@ void usage() {
   fprintf(stderr,
        "fluxcap version " FLUXCAP_VERSION "\n"
        "\n"
-       "usage: %s [-tx|-rx|-cr|-T|-io|-F|-m] [options] <ring>\n"
+       "usage: %s [-tx|-rx|-cr|-io|-F|-T] [options] <ring>\n"
        "\n"
        " transmit:       -tx -i <eth>  <ring>\n"
        " receive:        -rx -i <eth>  <ring>\n"
@@ -2051,7 +2051,7 @@ int main(int argc, char *argv[]) {
       if (cfg.size == 0) usage();
       while (optind < argc) {
         file = argv[optind++];
-        init_mode = SHR_DROP|SHR_FARM|SHR_APPDATA;
+        init_mode = SHR_DROP|SHR_FARM|SHR_MLOCK|SHR_APPDATA;
         if (cfg.keep) init_mode |= SHR_KEEPEXIST;
         if (cfg.verbose) fprintf(stderr,"creating %s\n", file);
         sc = shr_init(file, cfg.size, init_mode, &cfg.stats, sizeof(cfg.stats));
