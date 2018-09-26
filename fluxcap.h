@@ -33,6 +33,9 @@
 #define BATCH_PKTS 10000       /* max pkts to read in one shr_readv */
 #define TIMER_HZ 10            /* rainy day flush/stats timer freq */
 
+#define VLAN_LEN 4
+#define MACS_LEN (2*6)
+
 struct bb {
   size_t n; /* batch buffer size */
   size_t u; /* batch buffer used */

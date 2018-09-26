@@ -13,6 +13,7 @@ struct {
   char dev[MAX_NIC];
   unsigned long ticks;
   int vlan;
+  int pass_vlan;
   int tail;
   int fd;
   int tx_fd;
@@ -146,6 +147,7 @@ void usage() {
        "\n"
        "    -V <vlan>    (inject VLAN tag) [rx/tee/tx]\n"
        "    -Q           (strip VLAN tag) [rx]\n"
+       "    -f 'vlan n'  (pass packets tagged VLAN n) [tx]\n"
        "    -q           (bypass qdisc buffering layer) [tx]\n"
        "    -s <size>    (snaplen- truncate at this size)\n"
        "    -D <n>       (trim n tail bytes)\n"
@@ -157,7 +159,8 @@ void usage() {
        " VLAN tags may be stripped (-Q) on rx,\n"
        "  or replaced/inserted (-V <1-4095>) on rx,\n"
        "  or inserted (-V <1-4095>) on tee/tx,\n"
-       "  or left intact (default).\n"
+       "  or filtered (-f 'vlan <1-4095>') on tx/rx,\n"
+       "  or ignored and left intact (default).\n"
        "\n"
        " Kernel ring buffer options [rx/tx]\n"
        "\n"
@@ -1371,10 +1374,8 @@ int encapsulate_tx(char *tx, ssize_t nx) {
 
 /* inject four bytes to the ethernet frame with an 802.1q vlan tag.
  * note if this makes MTU exceeded it may result in sendto error */
-#define VLAN_LEN 4
 char buf[MAX_PKT];
 char vlan_tag[VLAN_LEN] = {0x81, 0x00, 0x00, 0x00};
-#define MACS_LEN (2*6)
 char *inject_vlan(char *tx, ssize_t *nx, uint16_t vlan) {
   if (((*nx) + 4) > MAX_PKT) return NULL;
   if ((*nx) <= MACS_LEN) return NULL;
@@ -1454,10 +1455,35 @@ int tee_packet(void) {
   return rc;
 }
 
+/* apply filtering to a rx or tx packet */
 int keep_packet(char *tx, size_t nx) {
-  if (cfg.drop_pct == 0) return 1;
-  int r = rand();
-  if ((r * 100.0 / RAND_MAX) < cfg.drop_pct) return 0;
+  uint16_t vlan;
+  int r;
+
+  /* apply vlan test, if enabled */
+  if (cfg.pass_vlan) {
+
+    if (nx < MACS_LEN + VLAN_LEN)
+      return 0;
+
+    if (memcmp(&tx[MACS_LEN], "\x81\x00", 2))
+      return 0;
+
+    memcpy(&vlan, &tx[MACS_LEN+2], sizeof(vlan));
+    vlan = ntohs(vlan);
+    vlan &= 0x0fff;
+
+    if (vlan != cfg.pass_vlan)
+      return 0;
+  }
+
+  /* apply random drop, if enabled */
+  if (cfg.drop_pct != 0) {
+    r = rand();
+    if ((r * 100.0 / RAND_MAX) < cfg.drop_pct)
+      return 0;
+  }
+
   return 1;
 }
 
@@ -1914,7 +1940,7 @@ int main(int argc, char *argv[]) {
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KRqk")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KRqkf:")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
@@ -1940,6 +1966,9 @@ int main(int argc, char *argv[]) {
                   if (strlen(optarg)+1 > MAX_NIC) goto done;
                   strncpy(cfg.dev, optarg, MAX_NIC);
                 }
+                break;
+      case 'f': sc = sscanf(optarg, "vlan %d", &cfg.pass_vlan);
+                if (sc != 1) usage();
                 break;
       case 'h': default: usage(); break;
     }
