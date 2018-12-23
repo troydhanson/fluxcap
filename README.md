@@ -5,34 +5,17 @@ Back to [my other projects](http://troydhanson.github.io/).
 
 fluxcap: a network tap replication and aggregation tool
 
-Network taps usually come from one of these sources:
+A Linux host running fluxcap can:
 
- * SPAN ports or mirror ports
- * network packet brokers
- * inline taps
+ * accept taps, on one or more physical network interfaces,
+ * aggregate them, possibly inserting VLAN tags,
+ * transmit them, on one of more physical network interfaces,
+ * send or receive taps in a GRE tunnel over an IP network.
 
-Once we have a tap- or many taps- we may want to:
+Fluxcap implements its features using raw sockets. It is
+written in C, MIT licensed, and for Linux only. 
 
- * copy the tap out to multiple appliances, or
- * make an aggregate tap from several small taps
-
-Usually, people buy network packet brokers for these purposes.
-Since regular switches move packets based on their L2 headers,
-*plugging a tap into a regular switch is asking for trouble!*
-Packet brokers solve the problem by using configuration rules,
-often very simply copying packets from one NIC to other NIC's.
-
-There is another way, too, instead of buying a packet broker.
-A regular Linux host, running fluxcap, can take in a tap and
-re-transmit it. Or, it can take in several taps and aggregate.
-It can add or remove VLAN tags on the packets while doing so.
-It can encapsulate a tap into a GRE tunnel over an IP network.
-It is a command-line tool, allowing the user to receive, merge
-and re-transmit network taps using the NIC's of the Linux host.
-
-Fluxcap is written in C, MIT licensed, and for Linux only. It
-runs on Ubuntu, RHEL, CentOS and others. No special hardware
-is needed.
+Platforms: Ubuntu, RHEL/CentOS are primary, but it works on others.
 
 # Build & install
 
@@ -41,15 +24,12 @@ is needed.
 In order to build and use fluxcap you need to install a few packages.
 
     # Ubuntu
-    sudo apt-get install git gcc automake autoconf libtool \
-      libncurses5-dev ethtool
+    sudo apt-get install git gcc automake autoconf libtool ethtool
 
     # RHEL/CentOS
-    sudo yum install git gcc automake autoconf libtool \
-      ncurses-devel ethtool
+    sudo yum install git gcc automake autoconf libtool ethtool
 
 Last, libshr must be built and installed prior to building fluxcap.
-Originally made for fluxcap, it is now built as a separate library.
 
     git clone https://github.com/troydhanson/shr.git
     cd shr
@@ -102,8 +82,8 @@ and execute it at startup via `/etc/rc.local` or similar.
       /sbin/ip link set dev $IF up
     done
 
-Last we mount a ramdisk at each boot. You can name it anything but
-this document uses /ram as the mountpoint. Add to /etc/fstab:
+Last we mount a ramdisk at each boot. You can name it anything; in
+this document, we use /ram as the mountpoint. Add to /etc/fstab:
 
     none  /ram   ramfs auto,noatime 0 0
 
@@ -117,8 +97,8 @@ Then make the mountpoint and mount it:
 When hardware offloading is left on, the NIC presents artificially large
 packets to the Linux host, by merging together IP packets in valid ways
 to reduce work the kernel would have to do in software. However, this is 
-really _undesirable_ for tap replication (and any kind of packet analysis)
-because the larger, conglomerated packets fail re-transmission; they may
+_undesirable_ for tap replication (and for any kind of packet analysis)
+because the larger, conglomerated packets fail re-transmission, and may
 vastly exceed MTU. Analysis tools want the original packets in any case.
 For the curious, an explanation of some offload parameters can be found
 [here](https://red.ht/2e608Oo). The usual symptom of skipping this step
@@ -189,17 +169,16 @@ and the last on eth3. (If you see messages like "sendto: too long"
 you should review the section on disabling NIC offloads above).
 
 We used `&` to put them in the background. You could run them in
-three separate terminals instead. In real life we put them under
-a process supervisor but that's for later.
+three separate terminals instead. In real life, we put them under
+a process supervisor, discussed further below.
 
-We can watch the I/O rates this way. (Hint: it looks better if you
-run inside a tmux session).
+We can watch the I/O rates this way:
 
     fluxcap -io cisco
 
-You can run `fluxcap -h` to see further options. For example we
-could add a VLAN tag on the data when it comes in from eth1. That
-helps keep things straight if we merge several taps down the road.
+We could add a VLAN tag on the data when it comes in from eth1. That
+helps distinguish things if we merge several taps down the road. Run
+`fluxcap -h` to see the VLAN tag injection and other options.
 
 ## Tap aggregation
 
@@ -258,20 +237,42 @@ The NIC offload script could be run from here too, instead of rc.local.
 
 ## Encapsulation modes
 
-Fluxcap can transmit taps over a regular network, using a GRE tunnel.
-To elaborate, this means receiving a tap on one NIC, then transmitting
-the tap packets _inside a layer of encapsulation_ over an IP network.
+Fluxcap can also transmit and receive taps over a regular IP network.  The
+packets travel inside a layer of GRE encapsulation.  The supported tunnel
+encapsulation modes are GRETAP, and regular GRE.  GRETAP (also called TEB for
+"transparent ethernet bridging") is preferred. It preserves the MAC addresses
+in the encapsulation, whereas GRE does not. ERSPAN is another way to transmit
+a tap inside GRE, it may be supported in fluxcap in the future.
 
-The supported tunnel encapsulation modes are GRETAP, GRE and ERSPAN.
-GRETAP, aka TEB for "transparent ethernet bridging", is preferred. It
-preserves the MAC addresses in the encapsulation, whereas GRE does not.
+### Transmitter
+
 In this example, the recipient tunnel endpoint is 192.168.102.100:
 
     fluxcap -tx -E gretap:192.168.102.100 ring
 
-Below we see it's easy to reverse the encapsulation on the receiving end.
+### Receiver
 
-#### Decapsulation 
+    fluxcap -rx -E gretap ring
+
+To limit the interface and/or the IP address on which GRE is received, use:
+
+    fluxcap -rx -E gretap:127.0.0.1 -i lo ring
+
+replacing 127.0.0.1 with the local IP address or replacing lo with an interface.
+
+### GRE keys
+
+It is possible to set the GRE key on a transmitted GRE/GRETAP tunnel
+using the `-K <key>` option. For example, `-K 500` sets the key to 500.
+This is useful when aggregating multiple taps over GRE, when there is a
+need to differentiate them on the receiving end.
+
+On the receiver, `-K <key>` specifies the key that should be accepted.
+
+The key can be specified as a 32-bit unsigned integer, or as a dotted
+quad IP of any meaning to the user.
+
+#### Receiver alternative: Linux OS decapsulation
 
 If the recipient host is Linux, it can decapsulate the tunnel for us.
 This creates a synthetic NIC on the host, ready for use with a packet
@@ -297,7 +298,7 @@ Now we can use gretap1 as if it were plugged into the remote tap. Try running
     # gre
 
     modprobe ip_gre
-    ip tunnel add gre1 mode gre remote 192.168.102.1 local 192.168.102.100 ttl 255
+    ip tunnel add gre1 type gre remote 192.168.102.1 local 192.168.102.100 ttl 255
     ip link set gre1 up
 
 ##### firewalld
@@ -308,16 +309,17 @@ system, `sudo systemctl stop firewalld` permits the data to arrive on gretap1.
 ##### MTU consideration
 
 When encapsulating packets, they grow. If the original packet was at the MTU of
-its network, and GRETAP encapsulation adds 24 bytes, then each packet may become
-two packets when sent over the tunnel. This occurs via IP fragmentation and is
-reversed on the remote end invisibly.
+its network, and GRETAP encapsulation adds 24 bytes (28 if a GRE key is used),
+then each packet may fragment into two packets when sent over the tunnel. This
+IP fragmentation is reversed on the remote end invisibly.
 
-However, fragmentation can be eliminated by either raising the MTU on the tunnel
-network, if that is an option, or by truncating the packets (`-s`) to a max
-length when encapsulating.  On a network with a 1500 byte MTU, `-s 1476` leaves
-room for the GRETAP header and stays within MTU.
+Fragmentation can be eliminated by raising the MTU on the tunnel network, or by
+truncating the packets (`-s`) to a max length when encapsulating.
 
     fluxcap -tx -s 1476 -E gretap:192.168.102.100 ring
+
+The syntax above would truncate at 1476 bytes, so that adding a 24-byte GRETAP
+header attains maximum MTU without fragmentation (on a 1500-byte MTU network).
 
 ## Other features
 

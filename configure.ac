@@ -1,4 +1,4 @@
-AC_INIT([fluxcap], 2.0)
+AC_INIT([fluxcap], 3.0)
 AM_INIT_AUTOMAKE([foreign subdir-objects])
 m4_ifdef([AM_SILENT_RULES],
     [AM_SILENT_RULES([yes])
@@ -19,18 +19,6 @@ then
   -----------------------------------------------------
   ])
 fi
-
-have_ncurses_header=n
-have_ncurses_lib=n
-AC_CHECK_HEADERS([ncurses.h],[have_ncurses_header=y])
-AC_CHECK_LIB(ncurses,initscr,[have_ncurses_lib=y])
-if test "x${have_ncurses_header}${have_ncurses_lib}" != xyy
-then
-  AM_CONDITIONAL(HAVE_NCURSES,false)
-else
-  AM_CONDITIONAL(HAVE_NCURSES,true)
-fi
-
 
 have_pcre_header=n
 have_pcre_lib=n

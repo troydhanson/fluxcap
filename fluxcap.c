@@ -4,6 +4,9 @@
  * fluxcap: a network tap replication and aggregation tool
  *
  */
+
+struct mmsghdr bss_msgv[BATCH_PKTS];
+
 struct {
   int verbose;
   char *prog;
@@ -17,6 +20,7 @@ struct {
   int tail;
   int fd;
   int tx_fd;
+  int rx_fd;
   int signal_fd;
   int timer_fd;
   int epoll_fd;
@@ -31,7 +35,6 @@ struct {
   UT_vector /* of ptr */ *aux_rings;
   UT_vector /* of int */ *aux_fd;
   UT_vector /* of utstring */ *aux_names;
-  UT_vector /* of utstring */ *tmp_files;
   UT_vector /* of struct bb */ *tee_bb;
   UT_vector /* of struct ww */ *watch_win;
   UT_string *tmp;
@@ -49,17 +52,16 @@ struct {
   int strip_vlan; /* strip VLAN on rx if present (boolean) */
   int drop_pct;   /* sampling % 0 (keep all)-100(drop all) */
   int use_tx_ring; /* 0 = sendto-based tx; 1=packet mmap ring-based tx */
-  int keep_going_on_tx_err;  /* ignore tx errors from malformed packets */
   int bypass_qdisc_on_tx; /* bypass kernel qdisc layer, more risk of loss */
   struct fluxcap_stats stats; /* used to periodically update rx/rd stats */
-  struct watch_ui ui;  /* in mode_watch, display state */
   int keep; /* in mode_create, keep existing ring if present */
   int losing;
+  struct bb gb;         /* used in gre rx for recvmmsg */
+  struct mmsghdr *msgv; /* used in gre rx for recvmmsg */
 } cfg = {
-  .bb.n = BATCH_SIZE,
-  .rb.n = BATCH_SIZE,
   .fd = -1,
   .tx_fd = -1,
+  .rx_fd = -1,
   .signal_fd = -1,
   .timer_fd = -1,
   .epoll_fd = -1,
@@ -70,51 +72,11 @@ struct {
     .it_value =    { .tv_sec = 0, .tv_nsec = 1 },
     .it_interval = { .tv_sec = 0, .tv_nsec = 1000000000UL / TIMER_HZ },
   },
+  .msgv = bss_msgv,
 };
 
-/*
- * support to vectorize struct iovec and struct bb 
- */
-UT_mm iov_mm = { . sz = sizeof(struct iovec) };
-void bb_init(void *_b) {
-  struct bb *b = (struct bb*)_b;
-  memset(b,0,sizeof(*b));
-  b->n = BATCH_SIZE;
-  int mode = MAP_PRIVATE | MAP_ANONYMOUS /* | MAP_LOCKED */;
-  b->d = mmap(0, b->n, PROT_READ|PROT_WRITE, mode, -1, 0);
-  if (b->d == MAP_FAILED) {
-    fprintf(stderr, "mmap: %s\n", strerror(errno));
-    abort();
-  }
-  b->iov = utvector_new(&iov_mm);
-  utvector_reserve(b->iov, BATCH_PKTS);
-}
-
-void bb_fini(void *_b) {
-  struct bb *b = (struct bb*)_b;
-  assert (b->d && (b->d != MAP_FAILED));
-  munmap(b->d, b->n);
-  utvector_free(b->iov);
-}
-
-void bb_clear(void *_b) {
-  struct bb *b = (struct bb*)_b;
-  b->u = 0;
-  utvector_clear(b->iov);
-}
-
-UT_mm bb_mm = { 
-  .sz = sizeof(struct bb),
-  .init = bb_init,
-  .fini = bb_fini,
-  .clear = bb_clear,
-};
-
-UT_mm ww_mm = {
-  .sz = sizeof(struct ww),
-};
-
-
+extern UT_mm bb_mm;
+UT_mm ww_mm = { .sz = sizeof(struct ww), };
 UT_mm _utmm_ptr = {.sz = sizeof(void*)};
 UT_mm* utmm_ptr = &_utmm_ptr;
 
@@ -130,18 +92,21 @@ void usage() {
        " transmit:       -tx -i <eth>  <ring>\n"
        " receive:        -rx -i <eth>  <ring>\n"
        " create:         -cr -s <size> [-k] <ring> ...\n"
-       " i/o rates:      -io <ring> ...\n"
+       " view-rates:     -io <ring> ...\n"
        " tee-out:        -T <src-ring> <dst-ring> ...\n"
        " funnel-in:      -F <dst-ring> <src-ring> ...\n"
        "\n"
        "  <size> may have k/m/g/t suffix\n"
        "  -k (create mode) keeps ring if already exists\n"
        "\n"
-       "GRE encapsulation modes (tx-only):\n"
-       "\n"
-       "    -tx -E gretap:<host> <ring>    (GRETAP encapsulation; preferred)\n"
-       "    -tx -E gre:<host>    <ring>    (GRE encapsulation)\n"
-       "    -tx -E erspan:<host> <ring>    (ERSPAN encapsulation; untested!)\n"
+       "GRE encapsulation modes:\n"
+       "  -tx -E gretap:<host>  [-K <key>]            <ring>  (GRETAP send)\n"
+       "  -rx -E gretap[:<ip>]> [-K <key>] [-i <eth>] <ring>  (GRETAP recv)\n"
+       "  -tx -E gre:<host>     [-K <key>]            <ring>  (GRE send)\n"
+       " where:\n"
+       "  <key>    GRE key/dotted quad (optional) [rx/tx]\n"
+       "  <ip>     binds a local IP    (optional) [rx]\n"
+       "  -i <eth> binds a local NIC   (optional) [rx]\n"
        "\n"
        "other options:\n"
        "\n"
@@ -152,7 +117,6 @@ void usage() {
        "    -s <size>    (snaplen- truncate at this size)\n"
        "    -D <n>       (trim n tail bytes)\n"
        "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx/tx]\n"
-       "    -K           (keep going/ignore tx errors) [tx]\n"
        "    -R           (use tx ring instead of sendto-based tx) [tx]\n"
        "    -v           (verbose)\n"
        "\n"
@@ -506,6 +470,59 @@ void describe_ring(char *label) {
   }
 }
 
+/* set up as a GRE receiver */
+int setup_rx_encap(void) {
+  struct sockaddr *sa;
+  int i, sc, rc = -1;
+  struct iovec *iov;
+  socklen_t sz;
+
+  cfg.rx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_GRE);
+  if (cfg.rx_fd == -1) {
+    fprintf(stderr,"socket: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* bind local IP; defaults to INADDR_ANY */
+  struct sockaddr_in in;
+  memset(&in, 0, sizeof(in));
+  in.sin_addr = cfg.encap.dst;
+  sa = (struct sockaddr*)&in;
+  sz = sizeof(in);
+
+  sc = bind(cfg.rx_fd, sa, sz);
+  if (sc < 0) {
+    fprintf(stderr, "bind: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* bind specific RX NIC if requested */
+  sz = strlen(cfg.dev);
+  sc = sz ? setsockopt(cfg.rx_fd, SOL_SOCKET, SO_BINDTODEVICE, cfg.dev, sz) : 0;
+  if (sc < 0) {
+    fprintf(stderr, "setsockopt: %s\n", strerror(errno));
+    goto done;
+  }
+
+  /* set up recvmmsg buffers */
+  assert(BATCH_SIZE == BATCH_PKTS * MAX_PKT);
+  assert(cfg.gb.n == BATCH_PKTS * MAX_PKT);
+  assert(cfg.gb.iov && (cfg.gb.iov->n == BATCH_PKTS));
+  cfg.gb.iov->i = cfg.gb.iov->n; /* mark slots used */
+  iov = (struct iovec*)utvector_head(cfg.gb.iov);
+  for(i=0; i < BATCH_PKTS; i++) {
+    iov[i].iov_base = cfg.gb.d + i * MAX_PKT;
+    iov[i].iov_len = MAX_PKT;
+    cfg.msgv[i].msg_hdr.msg_iov = &iov[i];
+    cfg.msgv[i].msg_hdr.msg_iovlen = 1;
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
 /* 
  * Prepare to read packets using a AF_PACKET socket with PACKET_RX_RING
  * 
@@ -741,15 +758,6 @@ int setup_tx(void) {
     goto done;
   }
 
-  /* by default we handle a tx error, due to a malformed packet, fatally. 
-   * we can instead ask the kernel to simply ignore them.  see packet(7) */
-  ec = cfg.keep_going_on_tx_err ?
-      setsockopt(cfg.tx_fd, SOL_PACKET, PACKET_LOSS, &one, sizeof(one)) : 0;
-  if (ec < 0) {
-    fprintf(stderr,"setsockopt PACKET_LOSS: %s\n", strerror(errno));
-    goto done;
-  }
-
   /* fill out the struct tpacket_req describing the ring buffer */
   memset(&cfg.req, 0, sizeof(cfg.req));
   cfg.req.tp_block_size = cfg.ring_block_sz; /* Min sz of contig block */
@@ -940,13 +948,13 @@ unsigned flux_log10( unsigned x ) {
  */
 char *format_rate(unsigned long bps, char *unit) {
   double b = bps;
-  char c = ' ';
-  if (b > 1024) { b /= 1024; c = 'K'; }
-  if (b > 1024) { b /= 1024; c = 'M'; }
-  if (b > 1024) { b /= 1024; c = 'G'; }
-  if (b > 1024) { b /= 1024; c = 'T'; }
+  char *c = "";
+  if (b > 1024) { b /= 1024; c = "K"; }
+  if (b > 1024) { b /= 1024; c = "M"; }
+  if (b > 1024) { b /= 1024; c = "G"; }
+  if (b > 1024) { b /= 1024; c = "T"; }
   utstring_clear(cfg.tmp);
-  utstring_printf(cfg.tmp, "%10.2f %c%s/s", b, c, unit);
+  utstring_printf(cfg.tmp, "%.0f %s%s/s", b, c, unit);
   return utstring_body(cfg.tmp);
 }
 
@@ -959,9 +967,9 @@ char *format_rate(unsigned long bps, char *unit) {
 int status_rings(void) {
   unsigned long start_tick, st, ct;
   struct shr_stat *ss;
-  double elapsed_sec;
-  size_t sz, nring;
-  int rc = -1, sc;
+  double elapsed_sec, lg10_b;
+  size_t sz;
+  int rc = -1, sc, i;
   char *name, *c;
   struct shr **r;
   struct ww *w;
@@ -969,14 +977,19 @@ int status_rings(void) {
   ssize_t nr;
   void *fs;
 
-  nring = utvector_len(cfg.aux_rings);
-  struct iovec wiov[nring], *iov;
+  /* unicode 1/8 width box progression */
+  char *blocks[] = {  "", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
+
+  printf("\033[1;1H"); /* position at line 0, col 0 */
+  printf("\033[1m"); /* bold */
+  printf(" %-20s | %-12s | %-12s | %-12s \n\n", 
+          "name", "rx-rate", "rx-drop", "tx-drop");
+  printf("\033[m"); /* reset attributes */
 
   /* go through the rings to obtain their in/out counters */
   s = NULL;
   r = NULL;
   w = NULL;
-  iov = wiov;
   while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
     s = (UT_string*)utvector_next(cfg.aux_names, s);
     w = (struct ww*)utvector_next(cfg.watch_win, w);
@@ -1014,10 +1027,11 @@ int status_rings(void) {
     elapsed_sec = (cfg.ticks - start_tick) * 1.0 / TIMER_HZ;
     memset( &w->ps, 0, sizeof(w->ps) );
     if (elapsed_sec > 0) {
-      w->ps.p = w->mw / elapsed_sec;
       w->ps.B = w->bw / elapsed_sec;
       w->ps.b = w->ps.B * 8;
-      w->ps.lg10_b = flux_log10( w->ps.b );
+      lg10_b = w->ps.b ? log10(w->ps.b) : 0;
+      w->ps.lg10_b = (unsigned)floor(lg10_b);      /* integer part */
+      w->ps.lg10_bf = (lg10_b - w->ps.lg10_b) * 8; /* fraction n/8 */
       w->ps.rx = w->rx / elapsed_sec;
       w->ps.rd = w->rd / elapsed_sec;
     }
@@ -1025,8 +1039,6 @@ int status_rings(void) {
     /* render strings */
     strncpy(w->name, name, NAME_MAX);
     w->name[NAME_MAX - 1] = '\0';
-    snprintf(w->ps.str.p,  RATE_MAX, "%lu", w->ps.p);
-    snprintf(w->ps.str.B,  RATE_MAX, "%lu", w->ps.B);
     snprintf(w->ps.str.b,  RATE_MAX, "%lu", w->ps.b);
     snprintf(w->ps.str.rx, RATE_MAX, "%lu", w->ps.rx);
     snprintf(w->ps.str.rd, RATE_MAX, "%lu", w->ps.rd);
@@ -1035,11 +1047,6 @@ int status_rings(void) {
     c = format_rate(w->ps.b, "bit");
 		assert(strlen(c)+1 <= RATE_MAX);
 		strncpy(w->ps.str.E, c, RATE_MAX);
-
-    /* packets/s in */
-    c = format_rate(w->ps.p, "pkt");
-		assert(strlen(c)+1 <= RATE_MAX);
-		strncpy(w->ps.str.P, c, RATE_MAX);
 
     /* rx (ingest) drops/s */
     c = format_rate(w->ps.rx, "bit");
@@ -1051,19 +1058,14 @@ int status_rings(void) {
 		assert(strlen(c)+1 <= RATE_MAX);
 		strncpy(w->ps.str.D, c, RATE_MAX);
 
-    iov->iov_base = w;
-    iov->iov_len = sizeof(*w);
-    iov++;
+    /* render to terminal */
+    printf(" %-20.20s | %-12s | %-12s | %-12s ", 
+      w->name, w->ps.str.E, w->ps.str.X, w->ps.str.D);
+    for(i=0; i < w->ps.lg10_b; i++) printf("%s", blocks[8]);
+    printf("%s", blocks[ w->ps.lg10_bf ]);
+    printf("\033[0K"); /* erase to end of line */
+    printf("\n");
   }
-
-  nr = shr_writev(cfg.ring, wiov, nring);
-  if (nr < 0) {
-    fprintf(stderr, "shr_writev: %zd\n", nr);
-    goto done;
-  }
-
-  sc = display_rates(&cfg.ui, wiov, nring);
-  if (sc < 0) goto done;
 
   rc = 0;
 
@@ -1134,29 +1136,6 @@ int timer_work(unsigned long nexp) {
 int show_stats(void) {
 
   return 0;
-}
-
-int handle_stdin(void) {
-  int rc = -1;
-  ssize_t nr;
-  char c;
-
-  assert(cfg.mode == mode_watch);
-
-  nr = read(STDIN_FILENO, &c, sizeof(c));
-  if (nr < 0) {
-    fprintf(stderr, "read: %s\n", strerror(errno));
-    goto done;
-  }
-
-  if (c == 'u') cfg.ui.unit = !cfg.ui.unit;
-  if (c == 'q') goto done;
-  if (c == ' ') goto done;
-
-  rc = 0;
-
- done:
-  return rc;
 }
 
 int handle_signal(void) {
@@ -1275,11 +1254,16 @@ int encapsulate_tx(char *tx, ssize_t nx) {
 
   switch(cfg.encap.mode) {
     case mode_gre:
-      memset(g, 0, 2);     /* zero first two bytes of GRE header */
+      memset(g, 0, 2); /* zero first two bytes of GRE header */
+      g[0] |= (cfg.encap.key ? (1U << 5) : 0); /* key bit */
       g += 2;
       ethertype = &tx[12]; /* copy ethertype from packet into GRE header */
       memcpy(g, ethertype, sizeof(uint16_t));
       g += 2;
+      if (cfg.encap.key) {
+        memcpy(g, &cfg.encap.key, 4);
+        g += 4;
+      }
       nx -= 14; tx += 14; // elide original MACs and ethertype!
       assert(nx <= sizeof(gbuf)-(g-gbuf));
       memcpy(g, tx, nx);
@@ -1287,41 +1271,16 @@ int encapsulate_tx(char *tx, ssize_t nx) {
       nx = g-gbuf;
       break;
     case mode_gretap:
-      memset(g, 0, 2);     /* zero first two bytes of GRE header */
+      memset(g, 0, 2); /* zero first two bytes of GRE header */
+      g[0] |= (cfg.encap.key ? (1U << 5) : 0); /* key bit */
       g += 2;
       encap_ethertype = htons(0x6558); /* transparent ethernet bridging */
       memcpy(g, &encap_ethertype, sizeof(uint16_t));
       g += 2;
-      assert(nx <= sizeof(gbuf)-(g-gbuf));
-      memcpy(g, tx, nx);
-      g += nx;
-      nx = g-gbuf;
-      break;
-    case mode_erspan:
-      g[0] = 1 << 4;  /* turn on GRE "S" bit to indicate sequence num option */
-      g[1] = 0;       /* zero next full byte of GRE header */
-      g += 2;
-      encap_ethertype = htons(0x88BE); /* ERSPAN type II */
-      memcpy(g, &encap_ethertype, sizeof(uint16_t));
-      g += 2;
-      seqno = htonl(cfg.encap.session_seqno++); /* GRE sequence number */
-      memcpy(g, &seqno, sizeof(uint32_t));
-      g += sizeof(uint32_t);
-      /* start ERSPAN Type 2 header (8 bytes) */
-      uint8_t cos = 0, t = 0;  /* TODO fill in with correct values */
-      g[0] = 1 << 4;   /* ERSPAN  version, 0x1 = Type II */
-      g[1] = 0;        /* lower 8 bits of the VLAN, we leave it in frame */
-      g[2] = cos << 5; /* class of service from original frame; do later */
-      g[2] |= 3 << 3;  /* trunk encap type 3 means preserved in frame */
-      g[2] |= t << 2;  /* truncation bit */
-      g[2] |= ((cfg.encap.session & 0x300) >> 8); /* MSB 2 bits of 10 */
-      g[3] = cfg.encap.session & 0xff;           /* LSB 8 bits of 10 */
-      g[4] = 0;        /* reserved MSB 8 of 12 bits */
-      g[5] = 0;        /* reserved LSB 4 of 12 bits, index bits 19-16 */
-      g[6] = 0;        /* index middle word; bits of 15-8 of index */
-      g[7] = 0;        /* index LSB word; bits 7-0 of index */
-      g += 8;
-      /* packet */
+      if (cfg.encap.key) {
+        memcpy(g, &cfg.encap.key, 4);
+        g += 4;
+      }
       assert(nx <= sizeof(gbuf)-(g-gbuf));
       memcpy(g, tx, nx);
       g += nx;
@@ -1710,7 +1669,7 @@ int transmit_packets(void) {
 }
 
 int receive_packets(void) {
-  int rc=-1, sw, wire_vlan, form_vlan;
+  int rc=-1, sw, wire_vlan, form_vlan, keep;
   ssize_t nr,nt,nx;
   struct iovec iov;
   char *tx;
@@ -1752,7 +1711,7 @@ int receive_packets(void) {
     /* trim N bytes from frame end if requested. */
     if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
 
-    int keep = keep_packet(tx,nx);
+    keep = keep_packet(tx,nx);
 
     /* push into batch buffer */
     sw = keep ? bb_write(cfg.ring, &cfg.bb, tx, nx) : 0;
@@ -1828,6 +1787,147 @@ int funnel(int pos) {
   return rc;
 }
 
+/* decode the gre packet into its fields.
+ * input pkt starts with outer IP header.
+ * fields are returned in network order!
+ * fields are zeroed if not present
+ * on decoding failure, returns -1.
+ * returns 0 on success
+ */
+#define GRE_MIN_HDR 4
+#define GRE_CHECKSUM_LEN 2
+#define GRE_RESERVED1_LEN 2
+#define GRE_KEY_LEN 4
+#define GRE_SEQNO_LEN 4
+int decode_gre(char *pkt, ssize_t nr, uint16_t *csum, uint32_t *key, 
+               uint32_t *seqno, char **payload, size_t *plen) {
+  int has_key, has_checksum, has_seqno, ko, co, so, po, ip_hdr_len;
+  uint8_t ip_proto;
+
+  *key = 0;
+  *seqno = 0;
+  *csum = 0;
+  *payload = NULL;
+  *plen = 0;
+
+  assert(nr > 0);
+  ip_hdr_len = (pkt[0] & 0x0f) * 4;
+
+  if (nr < ip_hdr_len + GRE_MIN_HDR)
+    return -1;
+
+  ip_proto = pkt[9];
+  if (ip_proto != IPPROTO_GRE)
+    return -1;
+
+  has_key      = pkt[ip_hdr_len] & (1U << 5);
+  has_checksum = pkt[ip_hdr_len] & (1U << 7);
+  has_seqno    = pkt[ip_hdr_len] & (1U << 4);
+
+  if (has_checksum) {
+    co = ip_hdr_len + GRE_MIN_HDR;
+    if (co + GRE_CHECKSUM_LEN > nr)
+      return -1;
+    memcpy(csum, pkt + co, GRE_CHECKSUM_LEN);
+  }
+
+  if (has_key) {
+    ko = ip_hdr_len + GRE_MIN_HDR
+         + (has_checksum ? GRE_CHECKSUM_LEN + GRE_RESERVED1_LEN : 0);
+    if (ko + GRE_KEY_LEN > nr)
+      return -1;
+    memcpy(key, pkt + ko, GRE_KEY_LEN);
+  }
+
+  if (has_seqno) {
+    so = ip_hdr_len + GRE_MIN_HDR +
+         + (has_checksum ? GRE_CHECKSUM_LEN + GRE_RESERVED1_LEN : 0)
+         + (has_key      ? GRE_KEY_LEN : 0);
+    if (so + GRE_SEQNO_LEN > nr)
+      return -1;
+    memcpy(seqno, pkt + so, GRE_SEQNO_LEN);
+  }
+
+  po = ip_hdr_len + GRE_MIN_HDR +
+       + (has_checksum ? GRE_CHECKSUM_LEN + GRE_RESERVED1_LEN : 0)
+       + (has_key      ? GRE_KEY_LEN : 0)
+       + (has_seqno    ? GRE_SEQNO_LEN : 0);
+
+  *plen = nr - po;
+  *payload = pkt + po;
+  return 0;
+}
+
+int handle_grerx(void) {
+  int i, rc=-1, sc, keep, nmsgs;
+  char *data, *tx, *pkt;
+  size_t dlen, nx, len;
+  uint32_t seqno, key;
+  uint16_t csum;
+  ssize_t nr;
+
+  nmsgs = recvmmsg(cfg.rx_fd, cfg.msgv, BATCH_PKTS, MSG_WAITFORONE, NULL);
+  if (nmsgs < 0) {
+    fprintf(stderr, "recvmmsg: %s\n", strerror(errno));
+    goto done;
+  }
+
+  if (cfg.verbose)
+    fprintf(stderr, "recvmmsg: %d messages received\n", nmsgs);
+
+  for(i=0; i < nmsgs; i++) {
+
+    pkt = cfg.msgv[i].msg_hdr.msg_iov[0].iov_base;
+    len = cfg.msgv[i].msg_len;
+    sc = decode_gre(pkt, len, &csum, &key, &seqno, &data, &dlen);
+    if (sc < 0) {
+      rc = 0;  /* ignore and drop bad packets */
+      goto done;
+    }
+
+    /* test key matches desired key */
+    if (cfg.encap.key != key) {
+      rc = 0;
+      goto done;
+    }
+
+    /* decapsulate packet, advance over GRE header */
+    tx = data;
+    nx = dlen;
+    if (nx == 0) {
+      rc = 0;
+      goto done;
+    }
+
+    /* inject 802.1q tag if requested */
+    if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
+    if (tx == NULL) {
+      fprintf(stderr, "vlan tag injection failed\n");
+      goto done;
+    }
+
+    /* truncate packet if requested */
+    if (cfg.size && (nx > cfg.size)) nx = cfg.size;
+
+    /* trim N bytes from frame end if requested. */
+    if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
+
+    keep = keep_packet(tx,nx);
+
+    /* push into batch buffer */
+    sc = keep ? bb_write(cfg.ring, &cfg.bb, tx, nx) : 0;
+    if (sc < 0) {
+      fprintf(stderr, "bb_write (%lu bytes): error code %d\n", (long)nx, sc);
+      goto done;
+    }
+  }
+
+  rc = 0;
+
+ done:
+  return rc;
+}
+
 int handle_io(void) {
   int rc = -1;
 
@@ -1882,39 +1982,42 @@ size_t kmgt(char *optarg) {
 }
 
 int parse_encap(char *opt) {
-  int rc = -1;
-  char *mode=opt,*dst=opt, *colon;
+  int rc = -1, len;
+  char *mode=opt,*name=opt, *colon;
   struct hostent *e;
 
   colon = strchr(mode,':');
-  if (colon == NULL) {
-    fprintf(stderr,"invalid encapsulation syntax\n");
+  if (colon) *colon = '\0';
+  else if (cfg.mode == mode_transmit) {
+    fprintf(stderr,"encapsulation syntax error\n");
     goto done;
   }
-  *colon = '\0';
 
   if      (!strcmp(mode,"gre"))    cfg.encap.mode = mode_gre;
   else if (!strcmp(mode,"gretap")) cfg.encap.mode = mode_gretap;
-  else if (!strcmp(mode,"erspan")) cfg.encap.mode = mode_erspan;
   else { 
     fprintf(stderr,"invalid encapsulation mode\n");
     goto done;
   }
 
-  dst = colon+1;
+  /* name is destination hostname (GRE tx mode),
+              or local IP to bind (GRE rx mode) */
+  if (colon) {
+    name = colon+1;
+    e = gethostbyname(name);
+    if (e == NULL) {
+      fprintf(stderr, "gethostbyname: %s: %s\n", name, hstrerror(h_errno));
+      goto done;
+    }
 
-  e = gethostbyname(dst);
-  if (e == NULL) {
-    fprintf(stderr, "gethostbyname: %s: %s\n", dst, hstrerror(h_errno));
-    goto done;
+    if (e->h_length != sizeof(cfg.encap.dst)) {
+      fprintf(stderr, "DNS result size mismatch\n");
+      goto done;
+    }
+
+    memcpy(&cfg.encap.dst.s_addr, e->h_addr, e->h_length);
   }
 
-  if (e->h_length != sizeof(cfg.encap.dst)) {
-    fprintf(stderr, "DNS result size mismatch\n");
-    goto done;
-  }
-
-  memcpy(&cfg.encap.dst.s_addr, e->h_addr, e->h_length);
   rc = 0;
 
  done:
@@ -1932,15 +2035,15 @@ int main(int argc, char *argv[]) {
 
   cfg.aux_rings = utvector_new(utmm_ptr);
   cfg.aux_names = utvector_new(utstring_mm);
-  cfg.tmp_files = utvector_new(utstring_mm);
   cfg.aux_fd = utvector_new(utmm_int);
   cfg.tee_bb = utvector_new(&bb_mm);
   cfg.watch_win = utvector_new(&ww_mm);
   utstring_new(cfg.tmp);
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
+  utmm_init(&bb_mm, &cfg.gb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:KRqkf:")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:K:Rqkf:")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
@@ -1959,7 +2062,9 @@ int main(int argc, char *argv[]) {
       case 'q': cfg.bypass_qdisc_on_tx = 1; break;
       case 'Q': cfg.strip_vlan = 1; break;
       case 'd': cfg.drop_pct=100-atoi(optarg); break;
-      case 'K': cfg.keep_going_on_tx_err = 1; break;
+      case 'K': cfg.encap.key = strchr(optarg, '.') ? 
+                inet_addr(optarg) : htonl(atoi(optarg));
+                break;
       case 'R': cfg.use_tx_ring = 1; break;
       case 'i': if (!strcmp(optarg, "o")) cfg.mode = mode_watch; /* -io */
                 else {                                           /* -i <nic> */
@@ -2030,8 +2135,11 @@ int main(int argc, char *argv[]) {
       cfg.file = (optind < argc) ? argv[optind++] : NULL;
       cfg.ring = shr_open(cfg.file, ring_mode);
       if (cfg.ring == NULL) goto done;
-      if (setup_rx() < 0) goto done;
-      if (new_epoll(EPOLLIN, cfg.fd)) goto done;
+      sc = cfg.encap.enable ? setup_rx_encap() : setup_rx();
+      if (sc < 0) goto done;
+      sc = cfg.encap.enable ? new_epoll(EPOLLIN, cfg.rx_fd) : 
+                              new_epoll(EPOLLIN, cfg.fd);
+      if (sc < 0) goto done;
       break;
     case mode_transmit:
       if ((cfg.dev == NULL) && (cfg.encap.enable == 0)) usage();
@@ -2100,18 +2208,8 @@ int main(int argc, char *argv[]) {
         utvector_push(cfg.aux_rings, &r);
         utvector_extend(cfg.watch_win);
       }
-      utstring_clear(cfg.tmp);
-      utstring_printf(cfg.tmp, "/dev/shm/stat.%u", (int)getpid());
-      file = utstring_body(cfg.tmp);
-      init_mode = SHR_DROP|SHR_FARM;
-      cfg.size = utvector_len(cfg.watch_win) * 
-                 (sizeof(size_t) + sizeof(struct ww));
-      sc = shr_init(file, cfg.size, init_mode);
-      if (sc < 0) goto done;
-      utvector_push(cfg.tmp_files, cfg.tmp);
-      cfg.ring = shr_open(file, SHR_WRONLY);
-      if (cfg.ring == NULL) goto done;
-      if (init_watch_ui(&cfg.ui) < 0) goto done;
+      /* clear screen, move to 0,0 */
+      printf("\033[2J\n");
       break;
     default:
       usage();
@@ -2129,10 +2227,15 @@ int main(int argc, char *argv[]) {
 
     if (sc == 0) { assert(0); goto done; }
     else if (ev.data.fd == cfg.signal_fd) { if (handle_signal() < 0) goto done;}
-    else if (ev.data.fd == STDIN_FILENO)  { if (handle_stdin()  < 0) goto done;}
     else if (ev.data.fd == cfg.timer_fd)  { if (handle_timer()  < 0) goto done;}
+    else if (ev.data.fd == cfg.rx_fd)     { if (handle_grerx()  < 0) goto done;}
     else if (ev.data.fd == cfg.fd)        { if (handle_io() < 0) goto done; }
+    else if (ev.data.fd == STDIN_FILENO)  { goto done; }
     else if (is_funnel(ev.data.fd, &pos)) { if (funnel(pos) < 0) goto done; }
+    else {
+      fprintf(stderr, "error: unknown descriptor\n");
+      goto done;
+    }
   }
   
   rc = 0;
@@ -2143,11 +2246,13 @@ done:
     if (cfg.fd != -1) close(cfg.fd);
   }
   if (cfg.tx_fd != -1) close(cfg.tx_fd);
+  if (cfg.rx_fd != -1) close(cfg.rx_fd);
   if (cfg.signal_fd != -1) close(cfg.signal_fd);
   if (cfg.timer_fd != -1) close(cfg.timer_fd);
   if (cfg.epoll_fd != -1) close(cfg.epoll_fd);
   utmm_fini(&bb_mm, &cfg.bb, 1);
   utmm_fini(&bb_mm, &cfg.rb, 1);
+  utmm_fini(&bb_mm, &cfg.gb, 1);
   if ((cfg.pb.n != 0) && (cfg.pb.d != MAP_FAILED)) {
     munmap(cfg.pb.d, cfg.pb.n); /* cfg.pb is mode specfic */
     assert(cfg.pb.iov == NULL); /* iov part of pb unused */
@@ -2157,14 +2262,9 @@ done:
   while ( (p = utvector_next(cfg.aux_rings, p))) shr_close(*p);
   utvector_free(cfg.aux_rings);
   utvector_free(cfg.aux_names);
-  while ( (p = utvector_next(cfg.tmp_files, p))) unlink(*p);
-  utvector_free(cfg.tmp_files);
   utvector_free(cfg.aux_fd);
   utstring_free(cfg.tmp);
   utvector_free(cfg.tee_bb);
   utvector_free(cfg.watch_win);
-  if (cfg.mode == mode_watch) {
-     fini_watch_ui(&cfg.ui);
-  }
   return rc;
 }

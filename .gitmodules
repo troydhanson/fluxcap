@@ -1,7 +1,3 @@
-[submodule "lib/tpl"]
-	path = lib/tpl
-	url = https://github.com/troydhanson/tpl.git
-  ignore = untracked
 [submodule "lib/libut"]
 	path = lib/libut
 	url = https://github.com/troydhanson/libut.git
