@@ -104,17 +104,17 @@ void usage() {
        "    -d <percent> (downsample to <0-99>%% [rx/tx]\n"
        "    -s <length>  (truncate at length) [rx/tx]\n"
        "    -D <n>       (trim n tail bytes) [rx/tx]\n"
-       "    -R           (ring tx not sendto) [tx]\n"
+       "    -R           (tpacket-based tx) [tx]\n"
        "    -q           (bypass qdisc layer) [tx]\n"
        "    -v           (verbose)\n"
        "\n"
-       " Kernel ring buffer options (TPACKET_V2) [rx/tx]\n"
+       " Kernel buffer options (TPACKET_V2) [rx/tx]\n"
        "  Defaults apply if left unspecified. To use these options\n"
        "  the block size must be a multiple of the system page size,\n"
        "  and be small since it consumes physically contiguous pages.\n"
-       "  The number of blocks can be large. Their product is the ring\n"
+       "  The number of blocks can be large. Their product is the buffer\n"
        "  capacity. The frame size must evenly divide the block size.\n"
-       "  The ring parameters are checked to satisfy these constraints.\n"
+       "  The parameters are checked to satisfy these constraints.\n"
        "  The frame size is for one packet (with overhead) so it should\n"
        "  exceed the MTU for full packet handling without truncation.\n"
        "    -Z <frame-size>  (max frame size)   [2048]\n"
@@ -895,30 +895,6 @@ int update_rd_drops(void) {
 
  done:
   return rc;
-}
-
-/*
- * flux_log10
- * 
- * compute floor of the base-10 log of x
- * an integer approximation without -lm
- * 
- *
- */
-unsigned flux_log10( unsigned x ) {
-  if (x == 0) return 0;
-  unsigned long n = 0;
-  unsigned long m = 10;
-  while(n <= 10) {
-    if (x < m) return n;
-    m *= 10;
-    n++;
-  }
-  /* (2^32 > 10^9) && (2^32 < 10^10)
-     thus log10 of 2^32 is between 9 and 10
-     thus floor(log10(2^32)) is 9
-   */
-  assert(0); 
 }
 
 /* returns volatile memory - use immediately or copy.
