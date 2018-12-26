@@ -10,8 +10,7 @@ struct mmsghdr bss_msgv[BATCH_PKTS];
 struct {
   int verbose;
   char *prog;
-  enum {mode_none, mode_transmit, mode_receive, mode_create, 
-        mode_tee, mode_funnel, mode_watch} mode;
+  enum {mode_none, mode_transmit, mode_receive, mode_create, mode_watch} mode;
   char *file;
   char dev[MAX_NIC];
   unsigned long ticks;
@@ -31,11 +30,8 @@ struct {
   struct itimerspec timer;
   uint16_t ip_id; /* for implementing IP fragmentation when */
   int mtu;        /* using gre encapsulation */
-  /* auxilliary rings; for tee or funnel modes */
-  UT_vector /* of ptr */ *aux_rings;
-  UT_vector /* of int */ *aux_fd;
-  UT_vector /* of utstring */ *aux_names;
-  UT_vector /* of struct bb */ *tee_bb;
+  UT_vector /* of ptr */ *watch_rings;
+  UT_vector /* of utstring */ *watch_names;
   UT_vector /* of struct ww */ *watch_win;
   UT_string *tmp;
   struct timeval now;
@@ -85,53 +81,34 @@ int sigs[] = {SIGHUP,SIGTERM,SIGINT,SIGQUIT,SIGALRM};
 
 void usage() {
   fprintf(stderr,
-       "fluxcap version " FLUXCAP_VERSION "\n"
+       "usage: %s [-cr|-tx|-rx|-io] [options] <ring>\n"
        "\n"
-       "usage: %s [-tx|-rx|-cr|-io|-F|-T] [options] <ring>\n"
-       "\n"
+       " create ring(s): -cr -s <size>[k|m|g|t] <ring> ...\n"
        " transmit:       -tx -i <eth>  <ring>\n"
        " receive:        -rx -i <eth>  <ring>\n"
-       " create:         -cr -s <size> [-k] <ring> ...\n"
-       " view-rates:     -io <ring> ...\n"
-       " tee-out:        -T <src-ring> <dst-ring> ...\n"
-       " funnel-in:      -F <dst-ring> <src-ring> ...\n"
-       "\n"
-       "  <size> may have k/m/g/t suffix\n"
-       "  -k (create mode) keeps ring if already exists\n"
+       " i/o view:       -io <ring> ...\n"
        "\n"
        "GRE encapsulation modes:\n"
        "  -tx -E gretap:<host>  [-K <key>]            <ring>  (GRETAP send)\n"
        "  -rx -E gretap[:<ip>]> [-K <key>] [-i <eth>] <ring>  (GRETAP recv)\n"
        "  -tx -E gre:<host>     [-K <key>]            <ring>  (GRE send)\n"
        " where:\n"
-       "  <key>    GRE key/dotted quad (optional) [rx/tx]\n"
-       "  <ip>     binds a local IP    (optional) [rx]\n"
-       "  -i <eth> binds a local NIC   (optional) [rx]\n"
+       "    <key> GRE key/dotted quad (optional) [rx/tx]\n"
+       "    <ip>  binds a local IP    (optional) [rx]\n"
+       "    <eth> binds a local NIC   (optional) [rx]\n"
        "\n"
-       "other options:\n"
-       "\n"
-       "    -V <vlan>    (inject VLAN tag) [rx/tee/tx]\n"
-       "    -Q           (strip VLAN tag) [rx]\n"
-       "    -f 'vlan n'  (pass packets tagged VLAN n) [tx]\n"
-       "    -q           (bypass qdisc buffering layer) [tx]\n"
-       "    -s <size>    (snaplen- truncate at this size)\n"
-       "    -D <n>       (trim n tail bytes)\n"
-       "    -d <%%>       (downsample to %% (0=drop all,100=keep all) [rx/tx]\n"
-       "    -R           (use tx ring instead of sendto-based tx) [tx]\n"
+       "Other options:\n"
+       "    -f 'vlan n'  (accept packets tagged VLAN n) [tx]\n"
+       "    -V <vlan>    (inject VLAN tag) [rx/tx]\n"
+       "    -Q           (remove VLAN tag) [rx]\n"
+       "    -d <percent> (downsample to <0-99>%% [rx/tx]\n"
+       "    -s <length>  (truncate at length) [rx/tx]\n"
+       "    -D <n>       (trim n tail bytes) [rx/tx]\n"
+       "    -R           (ring tx not sendto) [tx]\n"
+       "    -q           (bypass qdisc layer) [tx]\n"
        "    -v           (verbose)\n"
        "\n"
-       " VLAN tags may be stripped (-Q) on rx,\n"
-       "  or replaced/inserted (-V <1-4095>) on rx,\n"
-       "  or inserted (-V <1-4095>) on tee/tx,\n"
-       "  or filtered (-f 'vlan <1-4095>') on tx/rx,\n"
-       "  or ignored and left intact (default).\n"
-       "\n"
-       " Kernel ring buffer options [rx/tx]\n"
-       "\n"
-       " -Z <frame-size>      (max frame size, e.g. 2048)\n"
-       " -B <num-blocks>      (number of blocks comprising ring, e.g. 64)\n"
-       " -S <block-size>      (block size, log2; e.g. 22 = 4mb)\n"
-       "\n"
+       " Kernel ring buffer options (TPACKET_V2) [rx/tx]\n"
        "  Defaults apply if left unspecified. To use these options\n"
        "  the block size must be a multiple of the system page size,\n"
        "  and be small since it consumes physically contiguous pages.\n"
@@ -140,8 +117,12 @@ void usage() {
        "  The ring parameters are checked to satisfy these constraints.\n"
        "  The frame size is for one packet (with overhead) so it should\n"
        "  exceed the MTU for full packet handling without truncation.\n"
+       "    -Z <frame-size>  (max frame size)   [2048]\n"
+       "    -B <num-blocks>  (number of blocks) [64])\n"
+       "    -S <block-size>  (block size log2)  [22] (4mb)\n"
        "\n",
           cfg.prog);
+  fprintf(stderr, "fluxcap version: %s\n", FLUXCAP_VERSION);
   exit(-1);
 }
 
@@ -748,7 +729,6 @@ int setup_tx(void) {
   /*************************************************************
    * packet tx ring setup
    ************************************************************/
-
   if (check_ring_parameters() < 0) goto done;
 
   int v = TPACKET_V2;
@@ -990,8 +970,8 @@ int status_rings(void) {
   s = NULL;
   r = NULL;
   w = NULL;
-  while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
-    s = (UT_string*)utvector_next(cfg.aux_names, s);
+  while ( (r = (struct shr**)utvector_next(cfg.watch_rings, r))) {
+    s = (UT_string*)utvector_next(cfg.watch_names, s);
     w = (struct ww*)utvector_next(cfg.watch_win, w);
     assert(s);
     assert(w);
@@ -1088,19 +1068,6 @@ int timer_work(unsigned long nexp) {
 
   switch(cfg.mode) {
 
-    case mode_tee:
-      r = NULL;
-      b = NULL;
-      while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
-        b = (struct bb*)utvector_next(cfg.tee_bb, b); 
-        assert(b);
-        sc = bb_flush(*r, b);
-        if (sc < 0) goto done;
-      }
-      sc = update_rd_drops();
-      if (sc < 0) goto done;
-      break;
-
     case mode_transmit:
       sc = update_rd_drops();
       if (sc < 0) goto done;
@@ -1110,11 +1077,6 @@ int timer_work(unsigned long nexp) {
       sc = bb_flush(cfg.ring, &cfg.bb);
       if (sc < 0) goto done;
       sc = update_rx_drops();
-      if (sc < 0) goto done;
-      break;
-
-    case mode_funnel:
-      sc = bb_flush(cfg.ring, &cfg.bb);
       if (sc < 0) goto done;
       break;
 
@@ -1347,71 +1309,6 @@ char *inject_vlan(char *tx, ssize_t *nx, uint16_t vlan) {
   memcpy(buf+MACS_LEN+VLAN_LEN, tx + MACS_LEN, (*nx) - MACS_LEN);
   *nx += 4;
   return buf;
-}
-
-int tee_packet(void) {
-  struct iovec *io;
-  ssize_t nr,nt,nx;
-  struct shr **r;
-  int rc=-1, n;
-  struct bb *b;
-  size_t nio;
-
-  /* get pointers and lengths for the iov vector */
-  utvector_clear(cfg.rb.iov);
-  nio = cfg.rb.iov->n;
-  io = (struct iovec*)cfg.rb.iov->d;
-
-  /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
-  nr = shr_readv(cfg.ring, cfg.rb.d, cfg.rb.n, io, &nio);
-  if (nr < 0) {
-    fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
-    goto done;
-  }
-
-  /* record in vector number of used iov slots */
-  assert(nio <= cfg.rb.iov->n);
-  cfg.rb.iov->i = nio;
-
-  /* iterate over packets obtained in shr_readv */
-  io = NULL;
-  while ( (io = utvector_next(cfg.rb.iov, io))) {
-
-    char *tx = io->iov_base; /* packet */
-    nx = io->iov_len;        /* length */
-
-    /* inject 802.1q tag if requested */
-    if (cfg.vlan) tx = inject_vlan(tx,&nx,cfg.vlan);
-    if (tx == NULL) {
-      fprintf(stderr, "vlan tag injection failed\n");
-      goto done;
-    }
-
-    /* truncate outgoing packet if requested */
-    if (cfg.size && (nx > cfg.size)) nx = cfg.size;
-
-    /* trim N bytes from frame end if requested. */
-    if (cfg.tail && (nx > cfg.tail)) nx -= cfg.tail;
-
-    r = NULL;
-    b = NULL;
-    while ( (r = (struct shr**)utvector_next(cfg.aux_rings, r))) {
-      b = (struct bb*)utvector_next(cfg.tee_bb, b); 
-      assert(b);
-
-      nt = bb_write(*r, b, tx, nx);
-      if (nt < 0) {
-        fprintf(stderr, "bb_write error %ld\n", (long)nt);
-        goto done;
-      }
-    }
-
-  }
-
-  rc = 0;
-
- done:
-  return rc;
 }
 
 /* apply filtering to a rx or tx packet */
@@ -1733,60 +1630,6 @@ int receive_packets(void) {
   return rc;
 }
 
-/* 
- * funnel mode
- *
- * one of the rings funneling into the primary (output) ring is ready.
- * the index of the ready ring is pos. 
- * read elements from it, in batches, until wouldblock,
- * writing them to the primary
- */
-int funnel(int pos) {
-  struct iovec *io;
-  ssize_t nr, wr;
-  int rc = -1;
-  size_t nio;
-
-  struct shr **r = (struct shr**)utvector_elt(cfg.aux_rings, pos);
-  assert(r);
-
-  /* get pointers and lengths for the iov vector */
-  utvector_clear(cfg.rb.iov);
-  nio = cfg.rb.iov->n;
-  io = (struct iovec*)cfg.rb.iov->d;
-
-  /* read packets, up to BATCH_PKTS or BATCH_SIZE bytes */
-  nr = shr_readv(*r, cfg.rb.d, cfg.rb.n, io, &nio);
-  if (nr < 0) {
-    fprintf(stderr, "shr_readv error: %ld\n", (long)nr);
-    goto done;
-  }
-
-  /* record in vector number of used iov slots */
-  assert(nio <= cfg.rb.iov->n);
-  cfg.rb.iov->i = nio;
-
-  /* iterate over packets obtained in shr_readv */
-  io = NULL;
-  while ( (io = utvector_next(cfg.rb.iov, io))) {
-
-    char *pkt = io->iov_base; /* packet */
-    size_t len = io->iov_len; /* length */
-
-    /* funnel it into the output ring */
-    wr = bb_write(cfg.ring, &cfg.bb, pkt, len);
-    if (wr < 0) {
-      fprintf(stderr, "bb_write: error code %ld\n", (long)wr);
-      goto done;
-    }
-  }
-
-  rc = 0;
-
- done:
-  return rc;
-}
-
 /* decode the gre packet into its fields.
  * input pkt starts with outer IP header.
  * fields are returned in network order!
@@ -1938,28 +1781,12 @@ int handle_io(void) {
     case mode_transmit:
       rc = transmit_packets();
       break;
-    case mode_tee:
-      rc = tee_packet();
-      break;
     default:
       assert(0);
       break;
   }
 
   return rc;
-}
-
-/* test if fd is a funnel source */
-int is_funnel(int fd, int *opos) {
-  int *p = NULL, pos=0;
-  while ( (p = utvector_next(cfg.aux_fd, p))) {
-    if (*p == fd) {
-      *opos = pos;
-      return 1;
-    }
-    pos++;
-  }
-  return 0;
 }
 
 size_t kmgt(char *optarg) {
@@ -2033,23 +1860,19 @@ int main(int argc, char *argv[]) {
   char *file;
   void **p;
 
-  cfg.aux_rings = utvector_new(utmm_ptr);
-  cfg.aux_names = utvector_new(utstring_mm);
-  cfg.aux_fd = utvector_new(utmm_int);
-  cfg.tee_bb = utvector_new(&bb_mm);
+  cfg.watch_rings = utvector_new(utmm_ptr);
+  cfg.watch_names = utvector_new(utstring_mm);
   cfg.watch_win = utvector_new(&ww_mm);
   utstring_new(cfg.tmp);
   utmm_init(&bb_mm, &cfg.bb, 1);
   utmm_init(&bb_mm, &cfg.rb, 1);
   utmm_init(&bb_mm, &cfg.gb, 1);
 
-  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:TFE:B:S:Z:Qd:K:Rqkf:")) != -1) {
+  while ( (opt=getopt(argc,argv,"t:r:c:vi:hV:s:D:E:B:S:Z:Qd:K:Rqkf:")) != -1) {
     switch(opt) {
       case 't': cfg.mode = mode_transmit; if (*optarg != 'x') usage(); break;
       case 'r': cfg.mode = mode_receive;  if (*optarg != 'x') usage(); break;
       case 'c': cfg.mode = mode_create;   if (*optarg != 'r') usage(); break;
-      case 'T': cfg.mode = mode_tee; break;
-      case 'F': cfg.mode = mode_funnel; break;
       case 'E': cfg.encap.enable=1; if (parse_encap(optarg)) usage(); break;
       case 'v': cfg.verbose++; break;
       case 'k': cfg.keep=1; break;
@@ -2152,38 +1975,6 @@ int main(int argc, char *argv[]) {
       if (new_epoll(EPOLLIN, cfg.fd)) goto done;
       if (setup_tx() < 0) goto done;
       break;
-    case mode_funnel:
-      ring_mode = SHR_WRONLY;
-      cfg.file = (optind < argc) ? argv[optind++] : NULL;
-      cfg.ring = shr_open(cfg.file, ring_mode);
-      if (cfg.ring == NULL) goto done;
-      while (optind < argc) {
-        file = argv[optind++];
-        r = shr_open(file, SHR_RDONLY|SHR_NONBLOCK);
-        if (r == NULL) goto done;
-        utvector_push(cfg.aux_rings, &r);
-        int fd = shr_get_selectable_fd(r);
-        if (fd < 0) goto done;
-        utvector_push(cfg.aux_fd, &fd);
-        if (new_epoll(EPOLLIN, fd)) goto done;
-      }
-      break;
-    case mode_tee:
-      ring_mode = SHR_RDONLY|SHR_NONBLOCK;
-      cfg.file = (optind < argc) ? argv[optind++] : NULL;
-      cfg.ring = shr_open(cfg.file, ring_mode);
-      if (cfg.ring == NULL) goto done;
-      cfg.fd = shr_get_selectable_fd(cfg.ring);
-      if (cfg.fd < 0) goto done;
-      if (new_epoll(EPOLLIN, cfg.fd)) goto done;
-      while (optind < argc) {
-        file = argv[optind++];
-        r = shr_open(file, SHR_WRONLY);
-        if (r == NULL) goto done;
-        utvector_push(cfg.aux_rings, &r);
-        b = (struct bb*)utvector_extend(cfg.tee_bb);
-      }
-      break;
     case mode_create:
       if (cfg.size == 0) usage();
       while (optind < argc) {
@@ -2202,10 +1993,10 @@ int main(int argc, char *argv[]) {
         file = argv[optind++];
         utstring_clear(cfg.tmp);
         utstring_printf(cfg.tmp, "%s", file);
-        utvector_push(cfg.aux_names, cfg.tmp);
+        utvector_push(cfg.watch_names, cfg.tmp);
         r = shr_open(file, SHR_RDONLY);
         if (r == NULL) goto done;
-        utvector_push(cfg.aux_rings, &r);
+        utvector_push(cfg.watch_rings, &r);
         utvector_extend(cfg.watch_win);
       }
       /* clear screen, move to 0,0 */
@@ -2231,7 +2022,6 @@ int main(int argc, char *argv[]) {
     else if (ev.data.fd == cfg.rx_fd)     { if (handle_grerx()  < 0) goto done;}
     else if (ev.data.fd == cfg.fd)        { if (handle_io() < 0) goto done; }
     else if (ev.data.fd == STDIN_FILENO)  { goto done; }
-    else if (is_funnel(ev.data.fd, &pos)) { if (funnel(pos) < 0) goto done; }
     else {
       fprintf(stderr, "error: unknown descriptor\n");
       goto done;
@@ -2242,7 +2032,7 @@ int main(int argc, char *argv[]) {
 
 done:
   /* in these modes, fd is internal to shr and closed by it */
-  if ((cfg.mode != mode_transmit) && (cfg.mode != mode_tee)) {
+  if (cfg.mode != mode_transmit) {
     if (cfg.fd != -1) close(cfg.fd);
   }
   if (cfg.tx_fd != -1) close(cfg.tx_fd);
@@ -2259,12 +2049,10 @@ done:
   }
   if (cfg.ring) shr_close(cfg.ring);
   p = NULL;
-  while ( (p = utvector_next(cfg.aux_rings, p))) shr_close(*p);
-  utvector_free(cfg.aux_rings);
-  utvector_free(cfg.aux_names);
-  utvector_free(cfg.aux_fd);
+  while ( (p = utvector_next(cfg.watch_rings, p))) shr_close(*p);
+  utvector_free(cfg.watch_rings);
+  utvector_free(cfg.watch_names);
   utstring_free(cfg.tmp);
-  utvector_free(cfg.tee_bb);
   utvector_free(cfg.watch_win);
   return rc;
 }

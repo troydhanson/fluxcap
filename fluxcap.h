@@ -28,7 +28,7 @@
 #include "shr.h"
 #include "libut.h"
 
-#define FLUXCAP_VERSION "3.0"
+#define FLUXCAP_VERSION "3.1"
 #define MAX_NIC 64             /* longest NIC name we accept */
 #define MAX_PKT 10000          /* max length of packet */
 #define BATCH_PKTS 10000       /* max pkts to read in one shr_readv */
