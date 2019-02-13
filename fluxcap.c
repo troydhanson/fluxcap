@@ -1880,6 +1880,7 @@ int main(int argc, char *argv[]) {
 
   if ((cfg.drop_pct < 0) || (cfg.drop_pct > 100)) usage();
 
+  /* block all signals. we take signals synchronously via signalfd */
   sigset_t all;
   sigfillset(&all);
   sigprocmask(SIG_SETMASK,&all,NULL);
@@ -1982,7 +1983,6 @@ int main(int argc, char *argv[]) {
       usage();
   }
 
-  /* block all signals. we take signals synchronously via signalfd */
   alarm(1);
 
   while (1) {
