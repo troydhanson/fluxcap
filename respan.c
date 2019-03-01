@@ -438,9 +438,9 @@ int decode_gre(char *pkt, ssize_t nr, uint16_t *type, uint16_t *csum,
 #define ERSPAN_V1_HDR 8
 #define ERSPAN_V2_GRETYPE 0x22eb
 #define ERSPAN_V2_HDR 12
-int decode_erspan(uint16_t gre_type, char *in, size_t in_len, 
+int decode_erspan(uint16_t gre_type, uint8_t *in, size_t in_len, 
   char **out, size_t *out_len) {
-  int rc = -1;
+  int has_subhdr, rc = -1;
 
   gre_type = ntohs(gre_type);
 
@@ -453,9 +453,12 @@ int decode_erspan(uint16_t gre_type, char *in, size_t in_len,
       break;
     case ERSPAN_V2_GRETYPE: /* erspan version 2 aka Type III */
       if (in_len < ERSPAN_V2_HDR) goto done;
-      *out = in + ERSPAN_V2_HDR;
-      *out_len = in_len - ERSPAN_V2_HDR;
-      if (cfg.verbose) fprintf(stderr, " erspan v2\n");
+      /* test if ERSPAN "Optional subheader" flag is set */
+      has_subhdr = (in[11] & 0x1) ? 1 : 0;
+      *out = in + ERSPAN_V2_HDR + (has_subhdr ? 8 : 0);
+      *out_len = in_len - ERSPAN_V2_HDR - (has_subhdr ? 8 : 0);
+      if (cfg.verbose)
+        fprintf(stderr, " erspan v2 (sub_hdr: %d)\n", has_subhdr);
       break;
     default:
       fprintf(stderr, "unknown gre erspan type 0x%x\n", gre_type);
