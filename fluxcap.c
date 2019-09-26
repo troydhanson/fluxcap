@@ -88,10 +88,11 @@ void usage() {
        " receive:        -rx -i <eth>  <ring>\n"
        " i/o view:       -io <ring> ...\n"
        "\n"
-       "GRE encapsulation modes:\n"
+       "Encapsulation modes:\n"
        "    -tx -E gretap:<host>  [-K <key>]            <ring>  (GRETAP send)\n"
        "    -rx -E gretap[:<ip>]> [-K <key>] [-i <eth>] <ring>  (GRETAP recv)\n"
        "    -tx -E gre:<host>     [-K <key>]            <ring>  (GRE send)\n"
+       "    -tx -E vxlan:<host>   [-K <VNI>]            <ring>  (VXLAN send)\n"
        " where:\n"
        "    <key> GRE key/dotted quad (optional) [rx/tx]\n"
        "    <ip>  binds a local IP    (optional) [rx]\n"
@@ -1137,7 +1138,7 @@ int handle_timer(void) {
 /*
  * encapsulate_tx
  *
- * using a raw IP socket, transmit GRE-encapsulated packets.
+ * using a raw IP socket, transmit GRE-or-VXLAN encapsulated packets.
  * if necessary, perform IP fragmentation ourselves, as this
  * is not done by the OS when using raw sockets.
  */
@@ -1145,11 +1146,18 @@ char gbuf[MAX_PKT];
 int encapsulate_tx(char *tx, ssize_t nx) {
   uint16_t encap_ethertype, more_fragments=1, fo=0, fn=0;
   uint32_t ip_src, ip_dst, seqno, off;
+  char *g, *ethertype, ipproto;
   struct sockaddr_in sin;
   struct sockaddr *dst;
-  char *g, *ethertype;
   ssize_t nr, fl;
   socklen_t sz;
+
+  uint16_t vxlan_src_port;
+  uint16_t vxlan_dst_port;
+  uint16_t vxlan_udp_len;
+  uint16_t vxlan_udp_cksum;
+  uint8_t vxlan_flags;
+  uint8_t *vni_big_endian;
 
   assert(nx >= 14);
 
@@ -1166,6 +1174,9 @@ int encapsulate_tx(char *tx, ssize_t nx) {
   g = gbuf;
   off = 0;
 
+  /* use IPPROTO_GRE (47) for gre/gretap or IPPROTO_UDP (17) for vxlan */
+  ipproto = (cfg.encap.mode == mode_vxlan) ? IPPROTO_UDP : IPPROTO_GRE;
+
   /* construct 20-byte IP header. 
    * NOTE: some zeroed header fields are filled out for us, when we send this
    * packet; particularly, checksum, src IP; ID and total length. see raw(7).
@@ -1180,7 +1191,7 @@ int encapsulate_tx(char *tx, ssize_t nx) {
   g[6] = 0;       /* 0 DF MF flags and upper bits of frag offset */
   g[7] = 0;       /* lower bits of frag offset */
   g[8] = 255;     /* TTL */
-  g[9] = IPPROTO_GRE; /* IP protocol GRE == 47 */
+  g[9] = ipproto; /* IPPROTO_GRE or IPPROTO_UDP (VXLAN) */
   g[10] = 0;      /* IP checksum (high byte) (see NOTE) */
   g[11] = 0;      /* IP checksum (low byte) (see NOTE) */
   memcpy(&g[12], &ip_src, sizeof(ip_src)); /* IP source (see NOTE) */
@@ -1188,7 +1199,7 @@ int encapsulate_tx(char *tx, ssize_t nx) {
 
   g += 20;
 
-  /* GRE header starts */
+  /* GRE or UDP header starts */
 
   switch(cfg.encap.mode) {
     case mode_gre:
@@ -1219,6 +1230,31 @@ int encapsulate_tx(char *tx, ssize_t nx) {
         memcpy(g, &cfg.encap.key, 4);
         g += 4;
       }
+      assert(nx <= sizeof(gbuf)-(g-gbuf));
+      memcpy(g, tx, nx);
+      g += nx;
+      nx = g-gbuf;
+      break;
+    case mode_vxlan:
+      /* 8 byte UDP header */
+      vxlan_src_port = htons(9999);  /* arbitrary */
+      vxlan_dst_port = htons(4789);  /* IANA assigned VXLAN dest port */
+      vxlan_udp_len = htons(nx+8+8); /* payload + VXLAN header + UDP header */
+      vxlan_udp_cksum = htons(0);
+      memcpy(g+0, &vxlan_src_port, 2);
+      memcpy(g+2, &vxlan_dst_port, 2);
+      memcpy(g+4, &vxlan_udp_len, 2);
+      memcpy(g+6, &vxlan_udp_cksum, 2);
+      g += 8;
+      /* 8 byte VXLAN header */
+      vxlan_flags = 0x8; /* set I flag only */
+      memcpy(g+0, &vxlan_flags, 1);
+      memset(g+1, 0, 7); /* clear reserved bits */
+      /* vxlan VNI is 24 bit. copy the three LS bytes
+       * of cfg.encap.key. it's already in net order */
+      vni_big_endian = ((uint8_t*)&cfg.encap.key) + 1;
+      memcpy(g+4, vni_big_endian, 3);
+      g += 8;
       assert(nx <= sizeof(gbuf)-(g-gbuf));
       memcpy(g, tx, nx);
       g += nx;
@@ -1798,6 +1834,7 @@ int parse_encap(char *opt) {
 
   if      (!strcmp(mode,"gre"))    cfg.encap.mode = mode_gre;
   else if (!strcmp(mode,"gretap")) cfg.encap.mode = mode_gretap;
+  else if (!strcmp(mode,"vxlan"))  cfg.encap.mode = mode_vxlan;
   else { 
     fprintf(stderr,"invalid encapsulation mode\n");
     goto done;

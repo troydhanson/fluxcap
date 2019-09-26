@@ -10,7 +10,7 @@ A Linux host running fluxcap can:
  * accept taps, on one or more physical network interfaces,
  * aggregate them, possibly inserting VLAN tags,
  * transmit them, on one of more physical network interfaces,
- * send or receive taps in a GRE tunnel over an IP network.
+ * send or receive taps encapsulated in GRE or VXLAN over IP.
 
 Fluxcap implements its features using raw sockets. It is
 written in C, MIT licensed, and for Linux only. 
@@ -238,17 +238,25 @@ The NIC offload script could be run from here too, instead of rc.local.
 ## Encapsulation modes
 
 Fluxcap can also transmit and receive taps over a regular IP network.  The
-packets travel inside a layer of GRE encapsulation.  The supported tunnel
-encapsulation modes are GRETAP, and regular GRE.  GRETAP (also called TEB for
-"transparent ethernet bridging") is preferred. It preserves the MAC addresses
-in the encapsulation, whereas GRE does not. ERSPAN is another way to transmit
-a tap inside GRE, it may be supported in fluxcap in the future.
+packets travel inside a layer of GRE or VXLAN encapsulation.
+
+VXLAN encapsulates the original packet in a new UDP packet to port 4789, and
+prepends an 8-byte header having a network identifier (VNI).  Currently,
+fluxcap supports sending VXLAN but not receiving it.
+
+The GRE tunnel encapsulation modes are GRETAP, and regular GRE.  GRETAP (also
+called TEB for "transparent ethernet bridging") is preferred over GRE.
+GRETAP preserves the MAC addresses in the encapsulation, whereas GRE does not.
 
 ### Transmitter
 
-In this example, the recipient tunnel endpoint is 192.168.102.100:
+In this example, the GRETAP recipient tunnel endpoint is 192.168.102.100:
 
     fluxcap -tx -E gretap:192.168.102.100 ring
+
+A VXLAN transmitter example that sets the VNI to 1234 is:
+
+    fluxcap -tx -E vxlan:192.168.102.100 -K 1234 ring
 
 ### Receiver
 
@@ -271,6 +279,10 @@ On the receiver, `-K <key>` specifies the key that should be accepted.
 
 The key can be specified as a 32-bit unsigned integer, or as a dotted
 quad IP of any meaning to the user.
+
+### VNI
+
+When using VXLAN encapsulation, the `-K <key>` is interpreted as a VNI.
 
 #### Receiver alternative: Linux OS decapsulation
 

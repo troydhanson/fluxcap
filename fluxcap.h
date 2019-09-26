@@ -28,7 +28,7 @@
 #include "shr.h"
 #include "libut.h"
 
-#define FLUXCAP_VERSION "3.1"
+#define FLUXCAP_VERSION "3.2"
 #define MAX_NIC 64             /* longest NIC name we accept */
 #define MAX_PKT 10000          /* max length of packet */
 #define BATCH_PKTS 10000       /* max pkts to read in one shr_readv */
@@ -47,9 +47,9 @@ struct bb {
 
 struct encap { /* this is used in GRE encapsulation mode */
   int enable;
-  enum {mode_gre=0, mode_gretap} mode;
+  enum {mode_gre=0, mode_gretap, mode_vxlan} mode;
   struct in_addr dst; /* used as GRE TX dest IP, or GRE RX local IP */
-  uint32_t key;       /* if non-zero, indicates RX or TX GRE key */
+  uint32_t key;       /* if non-zero, indicates RX/TX GRE key, or VXLAN VNI */
 };
 
 struct fluxcap_stats {
