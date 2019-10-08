@@ -42,6 +42,13 @@ Last, libshr must be built and installed prior to building fluxcap.
 The libshr libraries and header files are now in `/usr/local/lib`
 and `/usr/local/include`.
 
+Note that on many systems, `/usr/local/lib` is not in the default
+library search path. On systems like this, it is usually possible
+to add `/usr/local/lib` to the library search path by running:
+
+    echo /usr/local/lib | sudo tee /etc/ld.so.conf.d/local.conf
+    sudo ldconfig
+
 ## fluxcap
 
 In the top-level directory of fluxcap, run:
